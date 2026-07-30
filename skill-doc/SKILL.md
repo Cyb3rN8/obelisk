@@ -65,12 +65,23 @@ session evidence before deciding whether a detail pass is needed:
 ```js
 const map = overview({ limit: 6 });
 const project = map.current.project?.project;
+// LOCAL: this index uses the trigram tokenizer, so the user's own language is
+// searchable directly — do not translate before searching. Probe both; each
+// search is ~1ms. Trigram needs >=3 characters; for shorter terms use sql()
+// with LIKE.
+const native = 'verbatim phrase from the user request, >=3 chars';
 const topic = 'English topic terms translated from the user request';
 
 return {
   orientation: map.current_project,
-  prior_memories: memories({ project, query: topic, limit: 5 }),
-  session_evidence: search(topic.replace(/[-_]/g, ' '), { project, limit: 8 }),
+  prior_memories: [
+    ...memories({ project, query: native, limit: 5 }),
+    ...memories({ project, query: topic, limit: 5 }),
+  ],
+  session_evidence: [
+    ...search(native, { project, limit: 8 }),
+    ...search(topic.replace(/[-_]/g, ' '), { project, limit: 8 }),
+  ],
 };
 ```
 
@@ -264,10 +275,11 @@ previously recorded, and compare it with raw session evidence when correctness
 depends on it. Raw session data is the evidence layer, but one hit is not a
 complete truth; query and cite it compactly.
 
-The memory layer is English-indexed. Use English terms in `memories({ query })`
-even when the user asks in another language. Write every `remember().summary`
-in English, regardless of the current conversation language. The runtime rejects
-obvious CJK text in memory queries and summaries as a guardrail.
+LOCAL: this install runs the trigram tokenizer and the English-only guardrail is
+disabled, so `memories({ query })` and `remember().summary` may use the user's
+own language. Prefer the language the conclusion was reached in, and keep
+queries >=3 characters. Older memories may still be English, so probe both
+languages when recall matters.
 
 **Recall:** query `memories({ query: 'English topic terms', project: '...' })`
 to find prior conclusions relevant to the current task. Translate non-English

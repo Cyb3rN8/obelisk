@@ -61,8 +61,14 @@ END;
 -- INSERT OR REPLACE, and REPLACE does not fire DELETE triggers unless
 -- recursive_triggers is on, so a trigger pair would leak stale rows. The
 -- indexer repopulates this table wholesale in finalize instead.
+-- LOCAL: trigram is pinned here rather than left to OBELISK_FTS_TOKENIZER.
+-- That migration drops and recreates the table, which works for external-content
+-- tables (they repopulate from their content table) but would empty this one --
+-- it owns its rows. Declaring it here means a fresh index is correct from the
+-- start, and the indexer's wholesale refresh keeps it that way.
 CREATE VIRTUAL TABLE IF NOT EXISTS tool_errors_fts USING fts5(
-  tool_use_id UNINDEXED, session_id UNINDEXED, content);
+  tool_use_id UNINDEXED, session_id UNINDEXED, content,
+  tokenize='trigram');
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
 CREATE INDEX IF NOT EXISTS idx_messages_agent ON messages(agent_id);
 CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(session_id, timestamp);

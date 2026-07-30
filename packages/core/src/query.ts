@@ -85,7 +85,15 @@ function assertReadOnlySql(sql: unknown): void {
 
 const CJK_TEXT_RE = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
 
+// LOCAL: the English-only guardrail existed because memories_fts was unicode61,
+// which indexes a run of CJK as a single token and makes CJK summaries
+// unrecallable. This install runs the trigram tokenizer, so the premise is gone
+// and memories may be written and queried in the user's own language.
+// Not upstreamed: it is only correct once a CJK-capable tokenizer is configured.
+const ENFORCE_ENGLISH_MEMORY = false;
+
 function assertEnglishMemoryText(value: unknown, label: string): void {
+  if (!ENFORCE_ENGLISH_MEMORY) return;
   const text = String(value || '');
   if (!text.trim()) return;
   if (CJK_TEXT_RE.test(text)) {

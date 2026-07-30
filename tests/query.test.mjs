@@ -126,14 +126,16 @@ test('memories follows list-helper scalar opts and filters by query within scope
   db.close();
 });
 
-test('memories requires English query terms', () => {
+// LOCAL: the English-only guardrail is disabled because this install runs the
+// trigram tokenizer, which indexes CJK. A CJK query must reach FTS instead of
+// being rejected up front. (Recall itself needs >=3 characters under trigram,
+// and the fixture index here is unicode61, so this asserts the call is allowed
+// rather than asserting a hit.)
+test('memories accepts queries in the user language', () => {
   const db = memoryDb();
   const api = createQueryApi(db);
 
-  assert.throws(
-    () => api.memories({ query: '记忆层', limit: 5 }),
-    /memories\(\) query must use English terms/,
-  );
+  assert.doesNotThrow(() => api.memories({ query: '记忆层', limit: 5 }));
 
   db.close();
 });
@@ -271,7 +273,7 @@ test('forget soft-deletes memory records from active recall', () => {
   db.close();
 });
 
-test('remember requires English summaries', () => {
+test('remember accepts summaries in the user language', () => {
   const projectDir = mkdtempSync(join(tmpdir(), 'obelisk-memory-project-'));
   const memoryDir = join(projectDir, '.obelisk', 'memories');
   mkdirSync(memoryDir, { recursive: true });
@@ -280,13 +282,15 @@ test('remember requires English summaries', () => {
   const db = memoryDb({ projectPath: projectDir });
   const api = createAttuneApi(db);
 
-  assert.throws(
-    () => api.remember({
-      path: '.obelisk/memories/decision.md',
-      session_id: 'sid-1',
-      summary: '决策：记忆摘要必须使用英文。',
-    }),
-    /remember\(\) summary must be written in English/,
+  const record = api.remember({
+    path: '.obelisk/memories/decision.md',
+    session_id: 'sid-1',
+    summary: '决策：记忆摘要可以用结论所用的语言书写。',
+  });
+  assert.equal(record.path, memoryPath);
+  assert.equal(
+    db.prepare('SELECT summary FROM memories WHERE id=?').get(record.id).summary,
+    '决策：记忆摘要可以用结论所用的语言书写。',
   );
 
   db.close();
