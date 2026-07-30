@@ -22,6 +22,7 @@ const topic = 'English topic terms translated from the user request';
 const map = overview({ limit: 6 });
 const project = map.current.project?.project;
 const scoped = project ? { project } : {};
+const self = 'current session_id';  // excluded below: it repeats the topic terms
 
 return {
   query_plan: {
@@ -47,7 +48,8 @@ return {
       summary: m.summary?.slice(0, 240),
     })),
   },
-  prior_memories: memories({ ...scoped, query: topic, limit: 5 }).map(m => ({
+  // Empty when overview reports memory_total: 0 — no memory layer in this project.
+  prior_memories: (map.current_project?.memory_total ? memories({ ...scoped, query: topic, limit: 5 }) : []).map(m => ({
     id: m.id,
     path: m.path,
     anchors: m.anchors,
@@ -56,7 +58,7 @@ return {
     rank: m.rank,
     summary: m.summary?.slice(0, 260),
   })),
-  session_evidence: search(topic.replace(/[-_]/g, ' '), { ...scoped, limit: 8 })
+  session_evidence: search(topic.replace(/[-_]/g, ' '), { ...scoped, excludeSession: self, limit: 8 })
     .slice(0, 6)
     .map(h => ({
       session_id: h.session.id,

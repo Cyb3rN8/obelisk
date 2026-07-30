@@ -65,22 +65,28 @@ session evidence before deciding whether a detail pass is needed:
 ```js
 const map = overview({ limit: 6 });
 const project = map.current.project?.project;
+const self = 'current session_id';  // the session you are running in
 // LOCAL: this index uses the trigram tokenizer, so the user's own language is
 // searchable directly — do not translate before searching. Probe both; each
 // search is ~1ms. Trigram needs >=3 characters; for shorter terms use sql()
-// with LIKE.
+// with LIKE. Probe one term per search: spaces are an implicit AND, so
+// '劳务分包 同意函' requires both phrases in the same message and usually
+// over-narrows. Split long CJK phrases into separate searches instead.
 const native = 'verbatim phrase from the user request, >=3 chars';
 const topic = 'English topic terms translated from the user request';
 
 return {
   orientation: map.current_project,
-  prior_memories: [
+  // Skip memory recall when overview reports memory_total: 0 — this project has
+  // no memory layer, and every memories() call would be a known-empty query.
+  prior_memories: map.current_project?.memory_total ? [
     ...memories({ project, query: native, limit: 5 }),
     ...memories({ project, query: topic, limit: 5 }),
-  ],
+  ] : [],
+  // excludeSession drops your own prompt, which repeats these very terms.
   session_evidence: [
-    ...search(native, { project, limit: 8 }),
-    ...search(topic.replace(/[-_]/g, ' '), { project, limit: 8 }),
+    ...search(native, { project, excludeSession: self, limit: 8 }),
+    ...search(topic.replace(/[-_]/g, ' '), { project, excludeSession: self, limit: 8 }),
   ],
 };
 ```
@@ -184,7 +190,11 @@ be treated as the user's request by default. `search()` and `thread()` omit meta
 messages unless `includeMeta: true` is passed; `context()` and `trace()` preserve
 the original chain and expose `is_meta` on rows.
 
-Opts: `{ limit, sessionId, project, after, before, cwd, source, includeMeta }`.
+Opts: `{ limit, sessionId, excludeSession, project, after, before, cwd, source, includeMeta }`.
+
+`excludeSession` takes one session ID or an array of them and filters in SQL,
+before `limit` applies. Use it for the current session; see Exclude Yourself in
+the Retrieval Contract.
 
 `project` is a SQL `LIKE` filter over `sessions.project`, not an exact project
 identity. Results are already ordered by FTS5 rank; lower rank sorts earlier.
@@ -236,6 +246,7 @@ filters or return fields.
 
 - `overview(opts?)` -- compact orientation map. Returns current cwd/project if knowable, global project/source counts, and current-project recent sessions plus memory records. It is a map, not evidence.
 - `sessions(opts?)` -- session rows, newest first. `project` is a SQL `LIKE` pattern.
+- Session `title` is usually not stored — current Claude Code versions rarely write one. `overview()`, `sessions()`, and `search()` therefore fall back to the first 80 characters of the opening user message. Read it as a navigation label, not as a curated title; it is `null` only when the session has no user text.
 - `recent(n?)` -- shorthand for recent sessions.
 - `summaries(opts?)` -- summary rows, newest first: `{ id, session_id, timestamp, source, content, session_title, project }`; here `source` is the summary kind, not the transcript provider.
 - `subagents(opts?)` -- subagent metadata plus `messageCount`.
@@ -252,12 +263,14 @@ filters or return fields.
 
 Keep queries scoped, bounded, and structural.
 
+- Disk Before Dialogue: if the request points at concrete paths (`@dir/`, a file) *and* that project keeps its decisions on disk — specs, ADRs, `CHANGELOG.md`, review notes, comments inside the artifacts themselves, a native agent memory directory — read those first. There the reasoning is written down deliberately; in chat it is scattered and partial. This is conditional, not a general rule: where decisions are never written down, session history is the only record and this step does not apply. Obelisk's irreplaceable jobs are the two the filesystem cannot do — decisions that were only ever spoken, and recovering your own earlier turns after the context window dropped them.
 - Scope First: classify the locator as scope, artifact, or semantic. Use the narrowest structural locator before FTS; empty scoped results are valid unless the user asks to broaden.
 - Orient First: for a new task, normally call `overview({ limit: 6 })` before deeper retrieval unless the user gave an exact session/message/file locator. It is a navigation map; confirm facts with `memories()`, `search()`, helpers, or, only when needed, `sql()`.
 - Helper First: prefer `overview()`, `memories()`, `search()`, `sessions()`, `summaries()`, `fileHistory()`, and other helpers for first-pass retrieval. Escalate to raw `sql()` only when helpers cannot express the needed join, grouping, or exact schema-level check.
 - Plan Before Probe: for conclusion, broad history, failure investigation, or file evolution, write a bounded retrieval script instead of spending turns on intermediate results.
 - Structure Before Text: compute counts, joins, grouping, dedupe, and projection in SQL or JS; keep runtime JSON compact, ideally under 10k-12k chars for synthesis tasks.
 - Evidence Before Conclusion: return compact evidence with stable IDs (`session_id`, `uuid`, `tool_call_id`, `run_id`, `agent_id`) and short snippets, then synthesize in the final answer.
+- Exclude Yourself: when searching history from inside a session, pass that session's ID as `excludeSession`. Your own prompt contains the search terms — they came from it — so it is a guaranteed hit that carries no prior knowledge. Excluding it in SQL keeps `limit` spent on other sessions; filtering the returned array does not.
 - Exclude Meta By Default: `is_meta=1` rows are injected/control-plane transcript material. Helpers hide them by default; raw SQL for ordinary conversation evidence should include `COALESCE(m.is_meta,0)=0` unless meta rows are the investigation target.
 - Persist Durable Conclusions: after answering, if retrieval produced a durable conclusion that future sessions are likely to reuse and `memories()` does not already cover it, explicitly offer to write a memory. Keep the offer brief. Do not write the markdown file or run `--attune` until the user approves.
 
@@ -290,6 +303,13 @@ Like other list helpers, passing a string is treated as `sessionId`, and passing
 a number is treated as `limit`. Read the file at `path` for full content.
 `memories()` returns active memories only. An archived memory is
 management/audit data, not recall data.
+
+If `overview()` reports `memory_total: 0`, this project has no Obelisk memory
+layer: skip `memories()` rather than issuing queries that are known to be empty.
+The agent harness may still keep its own memory directory —
+`~/.claude/projects/<project-slug>/memory/*.md` with a `MEMORY.md` index, one
+fact per file. Obelisk does not index it, so read those files directly when
+prior conclusions matter.
 
 Good memory candidates include design decisions, project conventions, abandoned
 alternatives, repeated failure causes, workflow patterns, and conclusions
@@ -407,6 +427,20 @@ return sql(
   hit.message.timestamp
 );
 ```
+
+Recover your own earlier turns after compaction — project inside the script, not
+in the returned JSON:
+
+```js
+return thread('current session_id', { limit: 200 })
+  .filter(m => m.content_type === 'text')          // drop thinking/tool_use rows
+  .slice(-40)
+  .map(m => ({ role: m.role, at: m.timestamp, text: m.text?.slice(0, 300) }));
+```
+
+`thread()` costs nothing inside the VM; what you `return` is what costs tokens.
+Returning raw rows ships empty `text` fields for every `thinking` and `tool_use`
+message.
 
 See `references/query-patterns.md` for longer recipes.
 
