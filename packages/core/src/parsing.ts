@@ -2,20 +2,26 @@
 // providers can be consumed by the app (better-sqlite3 / a Node without
 // node:sqlite). Originally extracted verbatim from db/indexer; it now exposes a
 // typed seam while remaining limited to node:fs/path/os.
-import { createRequire } from 'node:module';
-const require = createRequire(import.meta.url);
-const fs = require('node:fs');
-const path = require('node:path');
-const os = require('node:os');
+import { closeSync, existsSync, openSync, readSync, readdirSync, statSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { isAbsolute, join, normalize } from 'node:path';
 
-const CLAUDE_DIR = path.join(os.homedir(), '.claude');
-const CODEX_DIR = path.join(os.homedir(), '.codex');
-const PROJECTS_DIR = path.join(CLAUDE_DIR, 'projects');
-const CODEX_SESSIONS_DIR = path.join(CODEX_DIR, 'sessions');
+import type { InventoryIssue } from './providers/types.ts';
+
+const CLAUDE_DIR = join(homedir(), '.claude');
+const CODEX_DIR = join(homedir(), '.codex');
+const PROJECTS_DIR = join(CLAUDE_DIR, 'projects');
+const CODEX_SESSIONS_DIR = join(CODEX_DIR, 'sessions');
 const TEXT_LIMIT = 10000;
 
 type JsonRecord = Record<string, any>;
 type JsonValue = any;
+
+function sourceInventoryIssue(path: string, error: unknown): InventoryIssue {
+  return { path, error: error instanceof Error ? error.message : String(error) };
+}
+
+type DiscoveryIssueHandler = (issue: InventoryIssue) => void;
 
 export interface ClaudeJsonlFile {
   path: string;
@@ -102,16 +108,16 @@ function filePath(name: string, input: JsonRecord | null | undefined): string | 
   return ['Read', 'Edit', 'Write', 'NotebookEdit'].includes(name) ? (input.file_path || null) : null;
 }
 
-function isDir(p: string): boolean { try { return fs.statSync(p).isDirectory(); } catch { return false; } }
+function isDir(p: string): boolean { try { return statSync(p).isDirectory(); } catch { return false; } }
 
 function readLines(filePath: string, callback: (line: string) => boolean | void): void {
-  const fd = fs.openSync(filePath, 'r');
+  const fd = openSync(filePath, 'r');
   const bufSize = 64 * 1024;
   const buf = Buffer.alloc(bufSize);
   let remainder = '';
   let bytesRead;
   try {
-    while ((bytesRead = fs.readSync(fd, buf, 0, bufSize)) > 0) {
+    while ((bytesRead = readSync(fd, buf, 0, bufSize, null)) > 0) {
       const chunk = remainder + buf.toString('utf8', 0, bytesRead);
       const lines = chunk.split('\n');
       remainder = lines.pop() ?? '';
@@ -121,7 +127,7 @@ function readLines(filePath: string, callback: (line: string) => boolean | void)
     }
     if (remainder) callback(remainder);
   } finally {
-    fs.closeSync(fd);
+    closeSync(fd);
   }
 }
 
@@ -132,8 +138,8 @@ function legacyProjectPathFromSlug(project: string | null | undefined): string |
 }
 
 function normalizeObservedCwd(cwd: unknown): string | null {
-  if (typeof cwd !== 'string' || !cwd.trim() || !path.isAbsolute(cwd)) return null;
-  return path.normalize(cwd);
+  if (typeof cwd !== 'string' || !cwd.trim() || !isAbsolute(cwd)) return null;
+  return normalize(cwd);
 }
 
 function projectSlugFromPath(projectPath: string | null): string | null {
@@ -155,41 +161,44 @@ function inferProjectPath(project: string | null | undefined, observedCwds: unkn
   return best?.path || legacyProjectPathFromSlug(project);
 }
 
-function discoverJsonlFiles(projectsDir = PROJECTS_DIR): ClaudeJsonlFile[] {
+function discoverJsonlFiles(
+  projectsDir = PROJECTS_DIR,
+  reportIssue?: DiscoveryIssueHandler,
+): ClaudeJsonlFile[] {
   const files: ClaudeJsonlFile[] = [];
-  if (!fs.existsSync(projectsDir)) return files;
+  if (!existsSync(projectsDir)) return files;
   let projects;
-  try { projects = fs.readdirSync(projectsDir); } catch (e) { process.stderr.write(`Warning: cannot read projects dir: ${e instanceof Error ? e.message : String(e)}\n`); return files; }
+  try { projects = readdirSync(projectsDir); } catch (error) { reportIssue?.(sourceInventoryIssue(projectsDir, error)); return files; }
   for (const proj of projects) {
-    const projPath = path.join(projectsDir, proj);
+    const projPath = join(projectsDir, proj);
     if (!isDir(projPath)) continue;
     let entries;
-    try { entries = fs.readdirSync(projPath); } catch { continue; }
+    try { entries = readdirSync(projPath); } catch (error) { reportIssue?.(sourceInventoryIssue(projPath, error)); continue; }
     for (const f of entries) {
       if (f.endsWith('.jsonl'))
-        files.push({ path: path.join(projPath, f), sessionId: f.slice(0, -6), project: proj, isSubagent: false });
+        files.push({ path: join(projPath, f), sessionId: f.slice(0, -6), project: proj, isSubagent: false });
     }
     for (const sd of entries) {
-      const saDir = path.join(projPath, sd, 'subagents');
+      const saDir = join(projPath, sd, 'subagents');
       if (!isDir(saDir)) continue;
       let saEntries;
-      try { saEntries = fs.readdirSync(saDir); } catch { continue; }
+      try { saEntries = readdirSync(saDir); } catch (error) { reportIssue?.(sourceInventoryIssue(saDir, error)); continue; }
       for (const sf of saEntries) {
         if (sf.endsWith('.jsonl'))
-          files.push({ path: path.join(saDir, sf), sessionId: sd, project: proj, isSubagent: true, agentId: sf.slice(0, -6) });
+          files.push({ path: join(saDir, sf), sessionId: sd, project: proj, isSubagent: true, agentId: sf.slice(0, -6) });
       }
-      const wfRoot = path.join(saDir, 'workflows');
+      const wfRoot = join(saDir, 'workflows');
       if (!isDir(wfRoot)) continue;
       let wfDirs;
-      try { wfDirs = fs.readdirSync(wfRoot); } catch { continue; }
+      try { wfDirs = readdirSync(wfRoot); } catch (error) { reportIssue?.(sourceInventoryIssue(wfRoot, error)); continue; }
       for (const wfDir of wfDirs) {
-        const wfPath = path.join(wfRoot, wfDir);
+        const wfPath = join(wfRoot, wfDir);
         if (!isDir(wfPath)) continue;
         let wfEntries;
-        try { wfEntries = fs.readdirSync(wfPath); } catch { continue; }
+        try { wfEntries = readdirSync(wfPath); } catch (error) { reportIssue?.(sourceInventoryIssue(wfPath, error)); continue; }
         for (const wf of wfEntries) {
           if (wf.endsWith('.jsonl'))
-            files.push({ path: path.join(wfPath, wf), sessionId: sd, project: proj, isSubagent: true, agentId: wf.slice(0, -6), workflowRunId: wfDir });
+            files.push({ path: join(wfPath, wf), sessionId: sd, project: proj, isSubagent: true, agentId: wf.slice(0, -6), workflowRunId: wfDir });
         }
       }
     }
@@ -197,14 +206,17 @@ function discoverJsonlFiles(projectsDir = PROJECTS_DIR): ClaudeJsonlFile[] {
   return files;
 }
 
-function discoverCodexJsonlFiles(sessionsDir = CODEX_SESSIONS_DIR): CodexJsonlFile[] {
+function discoverCodexJsonlFiles(
+  sessionsDir = CODEX_SESSIONS_DIR,
+  reportIssue?: DiscoveryIssueHandler,
+): CodexJsonlFile[] {
   const files: CodexJsonlFile[] = [];
-  if (!fs.existsSync(sessionsDir)) return files;
+  if (!existsSync(sessionsDir)) return files;
   const walk = (dir: string): void => {
     let entries;
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch (error) { reportIssue?.(sourceInventoryIssue(dir, error)); return; }
     for (const entry of entries) {
-      const fp = path.join(dir, entry.name);
+      const fp = join(dir, entry.name);
       if (entry.isDirectory()) {
         walk(fp);
       } else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
@@ -368,10 +380,10 @@ function codexToolOutput(payload: JsonRecord): string | null {
 }
 
 export {
-  fs, path, os, CLAUDE_DIR, CODEX_DIR, PROJECTS_DIR, CODEX_SESSIONS_DIR, TEXT_LIMIT,
+  CLAUDE_DIR, CODEX_DIR, PROJECTS_DIR, CODEX_SESSIONS_DIR, TEXT_LIMIT,
   trunc, truncJson, extractText, extractContentType, extractMessageIsMeta, isSkillInstructions, filePath, isDir, readLines,
   legacyProjectPathFromSlug, normalizeObservedCwd, projectSlugFromPath, inferProjectPath,
-  discoverJsonlFiles, discoverCodexJsonlFiles,
+  discoverJsonlFiles, discoverCodexJsonlFiles, sourceInventoryIssue,
   codexDbId, codexRawId, codexLineUuid, codexCallId, codexParentThreadId, codexIsGuardianThread,
   readCodexGuardianThreadInfo, codexAgentNickname, codexAgentRole, parseCodexJsonInput,
   codexUsage, codexEventText, codexMessagePayloadText, codexVisibleMessageKey, codexToolInput, codexToolOutput,

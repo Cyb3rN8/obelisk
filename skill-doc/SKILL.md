@@ -1,7 +1,7 @@
 ---
 name: obelisk
 description: >
-  Search and query past Claude Code and Codex session history.
+  Search and query past Claude Code, Codex, Kimi Code, and Pi session history.
   Reactive: when the user asks "how did I fix X", "what did we do last time", "find the session where", "上次怎么修的", "之前的session", "历史记录".
   Proactive: when the user references past work you lack context for, when you're about to modify a file with complex edit history, when the user says "继续之前的" or "continue where we left off", or when understanding prior decisions would improve your current response.
   Memory: when the user says "记住这个", "remember this", "写入记忆", "save this conclusion", or when you determine a retrieval result contains a conclusion worth persisting.
@@ -13,18 +13,17 @@ allowed-tools:
 
 # obelisk
 
-Search and query Claude Code and Codex session history stored in `~/.claude/`
-and `~/.codex/`.
+Search and query local Claude Code, Codex, Kimi Code, and Pi session history.
 Obelisk indexes sessions, messages, tool calls, tool results, summaries,
 subagents, workflows, workflow agents, parent chains, and raw JSONL lines into
 SQLite + FTS5.
 
-Obelisk has two transcript sources. Treat both as ordinary sessions by default:
-Claude rows use `source='claude'`; Codex rows use `source='codex'` and IDs
-prefixed with `codex:`. Use `source` only when provenance matters or the user
-asks to scope to one provider. Codex subagent child threads are mapped to the
-same `subagents` table; Codex workflow rows may be absent because Codex does not
-emit Claude-style workflow metadata.
+Obelisk has four transcript sources. Treat all of them as ordinary sessions by
+default: Claude rows use `source='claude'`, Codex rows use `source='codex'`,
+Kimi Code rows use `source='kimi'`, and Pi rows use `source='pi'`. Use `source`
+only when provenance matters or the user asks to scope to one provider.
+Provider-specific records are projected into the same canonical tables; some
+providers may not emit every kind of subagent or workflow metadata.
 
 Obelisk is a CodeAct memory layer: write a small JS query, run it locally, read
 the JSON, then answer. Do not turn history into a flat document or browse entire
@@ -165,7 +164,7 @@ messages.
 Returns:
 
 ```js
-[{ message: { uuid, text, content_type, is_meta, role, timestamp, model, cwd, source },
+[{ message: { uuid, text, content_type, is_meta, role, timestamp, model, cwd, visibility, source },
    session: { id, title, project, started_at, source },
    rank,
    context }]
@@ -188,9 +187,23 @@ conversation evidence. `is_meta=1` marks injected caveats, command envelopes, or
 other messages that entered the transcript as user-role content but should not
 be treated as the user's request by default. `search()` and `thread()` omit meta
 messages unless `includeMeta: true` is passed; `context()` and `trace()` preserve
-the original chain and expose `is_meta` on rows.
+the current causal chain and expose `is_meta` on returned rows.
 
-Opts: `{ limit, sessionId, excludeSession, project, after, before, cwd, source, includeMeta }`.
+Pi can preserve a branch that was tried and later superseded as
+`visibility='inactive'`. Only Pi populates it: other sources either do not
+record supersession in their transcripts or discard it while indexing, so an
+empty inactive result never means nothing was abandoned -- only that this
+source cannot say. Default helpers return only `visible` evidence. Pass
+`includeInactive: true` to `search()`, `context()`, `trace()`, `thread()`,
+`summaries()`, `raw()`, `fileHistory()`, or `failures()` only when the abandoned
+path matters. Every returned message or evidence row is labeled with
+`visibility`; describe inactive evidence as something tried and then
+superseded, never as the final decision. `hidden` is reserved for
+display-suppressed or transport-only records and is never returned by these
+helpers, even with the option enabled.
+
+Opts:
+`{ limit, sessionId, excludeSession, project, after, before, cwd, source, includeMeta, includeInactive }`.
 
 `excludeSession` takes one session ID or an array of them and filters in SQL,
 before `limit` applies. Use it for the current session; see Exclude Yourself in
@@ -201,10 +214,10 @@ identity. Results are already ordered by FTS5 rank; lower rank sorts earlier.
 Prefer returned order over manually interpreting numeric rank unless you are
 deliberately using FTS5 semantics.
 
-`source` can be `'claude'`, `'codex'`, or omitted. Omitted means search all
-indexed sources.
+`source` can be `'claude'`, `'codex'`, `'kimi'`, `'pi'`, or omitted. Omitted
+means search all indexed sources.
 
-### `context(uuid)`
+### `context(uuid, opts?)`
 
 Returns the full story around one indexed message:
 
@@ -214,6 +227,8 @@ Returns the full story around one indexed message:
 
 Use this after `search()` finds a promising message. It is the usual way to
 expand vertically from one evidence point without dumping the whole session.
+The target and returned ancestors must be visible by default. Pass
+`{ includeInactive: true }` to follow an explicitly superseded Pi path.
 
 ### `sql(query, ...params)`
 
@@ -245,18 +260,18 @@ All list helpers accept a bounded `limit`. Many also accept:
 filters or return fields.
 
 - `overview(opts?)` -- compact orientation map. Returns current cwd/project if knowable, global project/source counts, and current-project recent sessions plus memory records. It is a map, not evidence.
-- `sessions(opts?)` -- session rows, newest first. `project` is a SQL `LIKE` pattern.
+- `sessions(opts?)` -- session rows, newest first. `project` is a SQL `LIKE` pattern. `message_count` counts the visible canonical transcript; inactive and hidden records are excluded.
 - Session `title` is usually not stored — current Claude Code versions rarely write one. `overview()`, `sessions()`, and `search()` therefore fall back to the first 80 characters of the opening user message. Read it as a navigation label, not as a curated title; it is `null` only when the session has no user text.
 - `recent(n?)` -- shorthand for recent sessions.
-- `summaries(opts?)` -- summary rows, newest first: `{ id, session_id, timestamp, source, content, session_title, project }`; here `source` is the summary kind, not the transcript provider.
+- `summaries(opts?)` -- summary rows, newest first: `{ id, session_id, timestamp, source, content, visibility, session_title, project }`; inactive rows require `includeInactive: true`, hidden rows are never returned, and `source` is the summary kind rather than the transcript provider.
 - `subagents(opts?)` -- subagent metadata plus `messageCount`.
 - `workflows(opts?)` -- workflow runs, newest first.
 - `workflowTree(runId)` -- workflow row plus parsed `result` and `agents`; may include bulky `script` and `result_json`, so project compact fields.
-- `fileHistory(filePath, opts?)` -- Read/Edit/Write tool calls for a file, oldest first; includes many `Read` rows.
-- `failures(opts?)` -- failed tool results with tool/session context, newest first.
-- `trace(uuid)` -- parent chain from root to message.
-- `thread(sessionId, opts?)` -- session messages ordered by timestamp, omitting meta messages by default. Pass `{ includeMeta: true }` when investigating injected context or command envelopes.
-- `raw(uuid, opts?)` -- windowed access to the original JSONL line.
+- `fileHistory(filePath, opts?)` -- Read/Edit/Write tool calls for a file, oldest first; includes many `Read` rows and labels each result with `visibility`.
+- `failures(opts?)` -- failed tool results with tool/session context and `visibility`, newest first.
+- `trace(uuid, opts?)` -- parent chain from root to message.
+- `thread(sessionId, opts?)` -- session messages ordered by timestamp, omitting meta messages by default. Pass `{ includeMeta: true }` for injected context or `{ includeInactive: true }` for superseded Pi history.
+- `raw(uuid, opts?)` -- windowed source access for one visible message. Pi returns the selected source-message container whether it was stored directly or inside a retained tail. Inactive targets require `includeInactive: true`; hidden targets return `null`.
 - `memories(opts?)` -- recall memory layer. opts: `{ query, project, sessionId, sessions, after, before, branch, limit }`. Without `query`, returns active memory records newest first. With `query`, searches `summary`/`path` through safe FTS5 tokenization and returns `rank`; lower rank sorts earlier. Records may include nullable JSON `anchors` for explicit recall surfaces such as files. Read the file at `path` for full content.
 
 ## Retrieval Contract
@@ -272,6 +287,7 @@ Keep queries scoped, bounded, and structural.
 - Evidence Before Conclusion: return compact evidence with stable IDs (`session_id`, `uuid`, `tool_call_id`, `run_id`, `agent_id`) and short snippets, then synthesize in the final answer.
 - Exclude Yourself: when searching history from inside a session, pass that session's ID as `excludeSession`. Your own prompt contains the search terms — they came from it — so it is a guaranteed hit that carries no prior knowledge. Excluding it in SQL keeps `limit` spent on other sessions; filtering the returned array does not.
 - Exclude Meta By Default: `is_meta=1` rows are injected/control-plane transcript material. Helpers hide them by default; raw SQL for ordinary conversation evidence should include `COALESCE(m.is_meta,0)=0` unless meta rows are the investigation target.
+- Exclude Superseded Paths By Default: ordinary evidence must use exact visible-only filtering. Opt into inactive Pi history only to explain an abandoned path, and label it as tried then superseded.
 - Persist Durable Conclusions: after answering, if retrieval produced a durable conclusion that future sessions are likely to reuse and `memories()` does not already cover it, explicitly offer to write a memory. Keep the offer brief. Do not write the markdown file or run `--attune` until the user approves.
 
 If field, context, ordering, FTS, or helper semantics affect the query, read
@@ -422,6 +438,7 @@ return sql(
   `SELECT uuid, role, timestamp, substr(text,1,240) AS snippet
    FROM messages
    WHERE session_id=? AND timestamp>=?
+     AND COALESCE(visibility, 'visible') = 'visible'
    ORDER BY timestamp LIMIT 6`,
   hit.session.id,
   hit.message.timestamp

@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, nextTick } from 'vue';
+import { ref, onMounted, onBeforeUnmount, nextTick } from 'vue';
 
 defineOptions({ name: 'Settings' });
 
@@ -7,12 +7,33 @@ const sources = ref([]);
 const dbPath = ref('');
 const recapPath = ref('');
 const autoRefresh = ref(true);
+const editorScheme = ref('vscode');
+const editorSchemes = [
+  { id: 'vscode', label: 'VS Code' },
+  { id: 'vscode-insiders', label: 'VS Code Insiders' },
+  { id: 'cursor', label: 'Cursor' },
+  { id: 'windsurf', label: 'Windsurf' },
+  { id: 'zed', label: 'Zed' },
+];
+const editorPicker = ref(null);
+const editorMenuOpen = ref(false);
 const memoryCount = ref(0);
 const rebuilding = ref(false);
-const version = ref('0.1.0');
+const version = ref('');
+let stopIndexUpdates = null;
 
 onMounted(async () => {
+  stopIndexUpdates = window.obelisk?.onIndexUpdated?.(() => loadSettings()) ?? null;
+  document.addEventListener('pointerdown', closeEditorMenuOutside);
+  document.addEventListener('keydown', closeEditorMenuOnEscape);
   await loadSettings();
+});
+
+onBeforeUnmount(() => {
+  stopIndexUpdates?.();
+  stopIndexUpdates = null;
+  document.removeEventListener('pointerdown', closeEditorMenuOutside);
+  document.removeEventListener('keydown', closeEditorMenuOnEscape);
 });
 
 async function loadSettings() {
@@ -22,7 +43,31 @@ async function loadSettings() {
   dbPath.value = s.dbPath || '';
   recapPath.value = s.recapDir || '~/.obelisk/recap';
   autoRefresh.value = s.autoRefresh !== false;
+  editorScheme.value = s.editorScheme || 'vscode';
   memoryCount.value = s.memoryCount || 0;
+  version.value = s.version || '';
+}
+
+async function saveEditorScheme(value) {
+  editorScheme.value = value;
+  await saveSetting('editorScheme', value);
+}
+
+function editorLabel(value = editorScheme.value) {
+  return editorSchemes.find(editor => editor.id === value)?.label || 'VS Code';
+}
+
+function closeEditorMenuOutside(event) {
+  if (!editorPicker.value?.contains(event.target)) editorMenuOpen.value = false;
+}
+
+function closeEditorMenuOnEscape(event) {
+  if (event.key === 'Escape') editorMenuOpen.value = false;
+}
+
+async function chooseEditor(value) {
+  editorMenuOpen.value = false;
+  await saveEditorScheme(value);
 }
 
 async function browseSourcePath(source) {
@@ -168,6 +213,61 @@ function fmtRelative(iso) {
         </label>
       </section>
 
+      <!-- Editor -->
+      <section class="settings-section">
+        <div class="settings-section-head">
+          <h2>Editor</h2>
+          <p>Which editor opens file references found in session transcripts.</p>
+        </div>
+        <div class="form-row">
+          <div>
+            <div class="form-label">Editor URL scheme</div>
+            <div class="form-label-hint">Clicking <code>src/app.ts:42</code> jumps to that line.</div>
+          </div>
+          <div class="form-control">
+            <div ref="editorPicker" class="editor-picker">
+              <button
+                type="button"
+                class="editor-picker-trigger"
+                :class="{ open: editorMenuOpen }"
+                aria-haspopup="listbox"
+                :aria-expanded="String(editorMenuOpen)"
+                aria-controls="editor-picker-menu"
+                @click="editorMenuOpen = !editorMenuOpen"
+              >
+                <span>{{ editorLabel() }}</span>
+                <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M3 4.5 6 7.5 9 4.5"/>
+                </svg>
+              </button>
+              <div
+                id="editor-picker-menu"
+                class="editor-picker-menu"
+                :class="{ show: editorMenuOpen }"
+                role="listbox"
+                aria-label="Editor URL scheme"
+              >
+                <button
+                  v-for="editor in editorSchemes"
+                  :key="editor.id"
+                  type="button"
+                  class="editor-picker-option"
+                  :class="{ selected: editor.id === editorScheme }"
+                  role="option"
+                  :aria-selected="String(editor.id === editorScheme)"
+                  @click="chooseEditor(editor.id)"
+                >
+                  <span>{{ editor.label }}</span>
+                  <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M2.5 6 5 8.5 9.5 3.5"/>
+                  </svg>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
       <!-- Recap -->
       <section class="settings-section">
         <div class="settings-section-head">
@@ -268,7 +368,7 @@ function fmtRelative(iso) {
 .source-card-name .vendor { font-size: 11.5px; color: var(--muted); font-weight: 400; }
 .source-card-status {
   font-family: var(--font-mono); font-size: 10.5px; color: var(--muted);
-  margin-top: 3px; display: flex; align-items: center; gap: 8px;
+  margin-top: 3px; display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
 }
 .source-card-status .stat-dot { width: 6px; height: 6px; border-radius: 50%; position: relative; }
 .source-card-status .stat-dot.ok { background: #34d399; box-shadow: 0 0 5px rgba(52,211,153,0.5); }
@@ -279,7 +379,7 @@ function fmtRelative(iso) {
   border: 1px solid #34d399; opacity: 0.5; animation: src-pulse 1.6s ease-out infinite;
 }
 @keyframes src-pulse { 0% { transform: scale(0.8); opacity: 0.5; } 100% { transform: scale(1.8); opacity: 0; } }
-.source-card-status .stat-text { color: var(--fg-2); }
+.source-card-status .stat-text { color: var(--fg-2); min-width: 0; overflow-wrap: anywhere; }
 .source-card-status .stat-text.ok { color: #34d399; }
 .source-card-status .stat-text.warn { color: #fbbf24; }
 .source-card-status .stat-text.error { color: #f87171; }
@@ -312,6 +412,42 @@ function fmtRelative(iso) {
 .path-field:focus { outline: 0; border-color: var(--accent); background: rgba(0,0,0,0.4); box-shadow: 0 0 0 2px rgba(167,139,250,0.12); }
 .path-field.error { border-color: rgba(248,113,113,0.4); }
 .path-field.error:focus { border-color: #f87171; box-shadow: 0 0 0 2px rgba(248,113,113,0.12); }
+.editor-picker { position: relative; width: 180px; }
+.editor-picker-trigger {
+  width: 100%; height: 28px; padding: 0 9px 0 10px;
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  border: 1px solid var(--hairline-strong); border-radius: 5px;
+  background: var(--surface); color: var(--fg-2);
+  font-size: 12px; font-weight: 500; text-align: left;
+  transition: background 0.12s, color 0.12s, border-color 0.12s, box-shadow 0.12s;
+}
+.editor-picker-trigger:hover,
+.editor-picker-trigger.open { background: var(--surface-strong); color: var(--fg); border-color: var(--hairline-vivid); }
+.editor-picker-trigger:focus-visible {
+  outline: 0; border-color: var(--accent); box-shadow: 0 0 0 2px rgba(167,139,250,0.12);
+}
+.editor-picker-trigger svg { width: 12px; height: 12px; color: var(--muted); flex-shrink: 0; transition: transform 0.15s; }
+.editor-picker-trigger.open svg { transform: rotate(180deg); color: var(--fg-2); }
+.editor-picker-menu {
+  position: absolute; top: calc(100% + 6px); left: 0; z-index: 100;
+  width: 100%; padding: 4px;
+  background: rgba(20,22,38,0.98); border: 1px solid var(--hairline-strong); border-radius: 7px;
+  box-shadow: 0 12px 32px rgba(0,0,0,0.55), inset 0 1px 0 rgba(255,255,255,0.04);
+  opacity: 0; transform: translateY(-4px); pointer-events: none;
+  transition: opacity 0.15s, transform 0.15s;
+}
+.editor-picker-menu.show { opacity: 1; transform: translateY(0); pointer-events: auto; }
+.editor-picker-option {
+  width: 100%; height: 29px; padding: 0 8px;
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  border-radius: 4px; color: var(--muted); font-size: 12px; text-align: left;
+  transition: background 0.08s, color 0.08s;
+}
+.editor-picker-option:hover,
+.editor-picker-option:focus-visible { outline: 0; background: rgba(255,255,255,0.04); color: var(--fg); }
+.editor-picker-option.selected { color: var(--fg-2); }
+.editor-picker-option svg { width: 12px; height: 12px; color: var(--accent-2); opacity: 0; }
+.editor-picker-option.selected svg { opacity: 1; }
 .tz-field { max-width: 240px; }
 
 .btn {

@@ -8,11 +8,9 @@
 // record uses countMode 'total' (persist replaces the count, never accumulates).
 // The per-line logic mirrors the original indexCodexJsonl.
 
-import { createRequire } from 'node:module';
+import { existsSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join, normalize, relative } from 'node:path';
-const require = createRequire(import.meta.url);
-const fs = require('node:fs');
 
 import {
   trunc, truncJson, readLines,
@@ -49,9 +47,12 @@ function messageVisibility(role: string, text: string | null): 'visible' | 'hidd
 
 function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
   const sessionsDir = join(rootDir, 'sessions');
+  if (!existsSync(sessionsDir) && (ctx.indexedSessions?.().length ?? 0) > 0) {
+    ctx.reportIncompleteInventory?.({ path: sessionsDir, error: 'Source folder is unavailable' });
+  }
   const sessionIndexPath = normalize(join(rootDir, 'session_index.jsonl'));
   const sessionIndex = new Map<string, { title: string; updatedAt: string | null }>();
-  if (fs.existsSync(sessionIndexPath)) {
+  if (existsSync(sessionIndexPath)) {
     readLines(sessionIndexPath, (line: string) => {
       try {
         const item = JSON.parse(line);
@@ -78,11 +79,11 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
     if (!inside || inside.startsWith('..') || isAbsolute(inside)) continue;
     if (absolute.toLowerCase().endsWith('.jsonl')) changedFiles.add(absolute);
   }
-  return discoverCodexJsonlFiles(sessionsDir).flatMap((file) => {
+  return discoverCodexJsonlFiles(sessionsDir, ctx.reportIncompleteInventory).flatMap((file) => {
     if (ctx.changedPaths !== undefined && !sessionIndexChanged && !changedFiles.has(normalize(file.path))) return [];
     const cursor = ctx.lastCursor(file.path);
     const guardian = readCodexGuardianThreadInfo(file.path);
-    if (!sessionIndexChanged && cursor !== null && Number(cursor.split(':')[0]) >= fs.statSync(file.path).mtimeMs && guardian === null) {
+    if (!sessionIndexChanged && cursor !== null && Number(cursor.split(':')[0]) >= statSync(file.path).mtimeMs && guardian === null) {
       return [];
     }
     let meta: any = null;
@@ -116,7 +117,7 @@ export function discover(ctx: DiscoverContext): IndexUnit[] {
 }
 
 export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRecord, Cursor> {
-  const mtime = fs.statSync(unit.key).mtimeMs;
+  const mtime = statSync(unit.key).mtimeMs;
   const records: { lineNum: number; obj: any }[] = [];
   let lineNum = 0;
   readLines(unit.key, (line: string) => {
@@ -189,7 +190,7 @@ export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRe
     out.push(rec);
     msgByUuid.set(uuid, rec);
     sm.lastMessageUuid = uuid;
-    if (!agentId) sm.n++;
+    if (!agentId && visibility === 'visible') sm.n++;
     if (type === 'assistant' && contentType === 'text') sm.lastTextAssistantUuid = uuid;
     updateBounds(timestamp);
     return uuid;
@@ -316,8 +317,8 @@ function findCodexFile(rootDir: string, rawThreadId: string): string | null {
   const stack = [join(rootDir, 'sessions')];
   while (stack.length > 0) {
     const current = stack.pop()!;
-    if (!fs.existsSync(current)) continue;
-    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+    if (!existsSync(current)) continue;
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
       const path = join(current, entry.name);
       if (entry.isDirectory()) stack.push(path);
       else if (entry.isFile() && entry.name.endsWith(`${rawThreadId}.jsonl`)) return path;
@@ -332,7 +333,7 @@ function rawCodex(rootDir: string, input: RawLookup): RawRecord | null {
   const path = input.agentId === null && typeof input.session?.jsonl_path === 'string'
     ? input.session.jsonl_path
     : findCodexFile(rootDir, match[1]!);
-  if (path === null || !fs.existsSync(path)) return null;
+  if (path === null || !existsSync(path)) return null;
   let lineNumber = 0;
   let found: string | null = null;
   readLines(path, (line: string) => {

@@ -1,5 +1,6 @@
 import type {
   TranscriptRecord,
+  MessageVisibility,
   MessageRecord,
   SessionRecord,
   SummaryRecord,
@@ -19,6 +20,8 @@ export interface SessionDetailMessage {
   text: string | null;
   content_type: string | null;
   is_meta: 0 | 1;
+  session_id: string | null;
+  cwd: string | null;
   turn_duration_ms: number | null;
 }
 
@@ -161,6 +164,9 @@ export interface SessionSummaryRow {
   [key: string]: unknown;
   id: string | number;
   session_id?: string | null;
+  visibility?: string | null;
+  input_tokens?: number | null;
+  output_tokens?: number | null;
 }
 
 export interface SessionDetailRows {
@@ -178,6 +184,12 @@ function withoutKind<T extends { kind: string }>(record: T): WithoutKind<T> {
   return value;
 }
 
+function canonicalVisibility(value: unknown): MessageVisibility {
+  if (value === null || value === undefined || value === 'visible') return 'visible';
+  if (value === 'inactive') return 'inactive';
+  return 'hidden';
+}
+
 function assembleMessages(
   messages: SessionDetailMessage[],
   toolCalls: ToolCallRecord[],
@@ -185,8 +197,19 @@ function assembleMessages(
   subagents: Extract<TranscriptRecord, { kind: 'subagent' }>[],
   workflows: SessionDetailWorkflow[],
 ): AssembledMessage[] {
+  const visibleMessageUuids = new Set(messages.map((message) => message.uuid));
+  const visibleToolCalls = toolCalls.filter((toolCall) => visibleMessageUuids.has(toolCall.message_uuid));
+  const visibleToolResults = toolResults.filter((result) => visibleMessageUuids.has(result.message_uuid));
+  const visibleCallIds = new Set(visibleToolCalls.map((toolCall) => toolCall.id));
+  const attachedResultMessageUuids = new Set(
+    visibleToolResults
+      .filter((result) => visibleCallIds.has(result.tool_use_id))
+      .map((result) => result.message_uuid),
+  );
   const resultsByCallId = new Map<string, SessionDetailToolResult>();
-  for (const result of toolResults) resultsByCallId.set(result.tool_use_id, withoutKind(result));
+  for (const result of visibleToolResults) {
+    resultsByCallId.set(result.tool_use_id, withoutKind(result));
+  }
 
   const subagentsByCallId = new Map<string, Extract<TranscriptRecord, { kind: 'subagent' }>>();
   for (const subagent of subagents) {
@@ -199,7 +222,7 @@ function assembleMessages(
       .filter((workflow) => workflow.parent_tool_use_id)
       .map((workflow) => [workflow.parent_tool_use_id as string, workflow]),
   );
-  for (const toolCall of toolCalls) {
+  for (const toolCall of visibleToolCalls) {
     const call: AssembledToolCall = {
       id: toolCall.id,
       name: toolCall.name,
@@ -232,7 +255,10 @@ function assembleMessages(
   const output: AssembledMessage[] = [];
   for (let index = 0; index < raw.length; index++) {
     const message = raw[index];
-    if (message.content_type === 'tool_result') continue;
+    if (
+      message.content_type === 'tool_result'
+      && attachedResultMessageUuids.has(message.uuid)
+    ) continue;
 
     if (message.type === 'assistant' && message.content_type === 'thinking') {
       const thinkingParts = [message.text ?? ''];
@@ -270,7 +296,10 @@ function assembleMessages(
       let nextIndex = index + 1;
       while (nextIndex < raw.length) {
         const next = raw[nextIndex];
-        if (next.content_type === 'tool_result') {
+        if (
+          next.content_type === 'tool_result'
+          && attachedResultMessageUuids.has(next.uuid)
+        ) {
           nextIndex++;
           continue;
         }
@@ -301,7 +330,10 @@ function assembleMessages(
       let nextIndex = index + 1;
       while (nextIndex < raw.length) {
         const next = raw[nextIndex];
-        if (next.content_type === 'tool_result') {
+        if (
+          next.content_type === 'tool_result'
+          && attachedResultMessageUuids.has(next.uuid)
+        ) {
           nextIndex++;
           continue;
         }
@@ -357,7 +389,7 @@ function assembleTranscriptRecords(records: Iterable<TranscriptRecord>): Session
         };
         break;
       case 'message': {
-        if (record.visibility === 'hidden') break;
+        if (canonicalVisibility(record.visibility) !== 'visible') break;
         const message: SessionDetailMessage = {
           uuid: record.uuid,
           type: record.type || record.role,
@@ -365,6 +397,10 @@ function assembleTranscriptRecords(records: Iterable<TranscriptRecord>): Session
           text: record.text,
           content_type: record.content_type,
           is_meta: record.is_meta,
+          // Both kept per message, not per session: the working directory can change
+          // mid-session, and the session id scopes which roots a file reference may resolve in.
+          session_id: typeof record.session_id === 'string' ? record.session_id : null,
+          cwd: typeof record.cwd === 'string' ? record.cwd : null,
           turn_duration_ms: typeof (record as MessageRecord & { turn_duration_ms?: unknown }).turn_duration_ms === 'number'
             ? (record as MessageRecord & { turn_duration_ms: number }).turn_duration_ms
             : null,
@@ -395,6 +431,7 @@ function assembleTranscriptRecords(records: Iterable<TranscriptRecord>): Session
         } as WorkflowAgentRecord);
         break;
       case 'summary':
+        if (canonicalVisibility(record.visibility) !== 'visible') break;
         summaries.push(withoutKind(record));
         break;
       case 'message-turn-duration': {
@@ -481,7 +518,7 @@ function sessionDetailRecordsFromRows(input: SessionDetailRows): TranscriptRecor
       text: typeof message.text === 'string' ? message.text : null,
       content_type: typeof message.content_type === 'string' ? message.content_type : null,
       is_meta: message.is_meta ? 1 : 0,
-      visibility: message.visibility === 'hidden' ? 'hidden' : 'visible',
+      visibility: canonicalVisibility(message.visibility),
       model: typeof message.model === 'string' ? message.model : null,
       is_sidechain: message.is_sidechain ? 1 : 0,
       agent_id: typeof message.agent_id === 'string' ? message.agent_id : null,
@@ -577,6 +614,9 @@ function sessionDetailRecordsFromRows(input: SessionDetailRows): TranscriptRecor
       timestamp: typeof summary.timestamp === 'string' ? summary.timestamp : null,
       source: typeof summary.source === 'string' ? summary.source : '',
       content: typeof summary.content === 'string' ? summary.content : '',
+      visibility: canonicalVisibility(summary.visibility),
+      input_tokens: typeof summary.input_tokens === 'number' ? summary.input_tokens : null,
+      output_tokens: typeof summary.output_tokens === 'number' ? summary.output_tokens : null,
     });
   }
   return records;

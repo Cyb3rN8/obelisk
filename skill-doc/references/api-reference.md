@@ -58,8 +58,9 @@ Full-text search across all indexed message text using FTS5.
 | `opts.after` | `string` | ISO lower bound on message timestamp |
 | `opts.before` | `string` | ISO upper bound on message timestamp |
 | `opts.cwd` | `string` | SQL `LIKE` filter over `messages.cwd` |
-| `opts.source` | `string` | `"claude"`, `"codex"`, or omitted/all |
+| `opts.source` | `string` | Provider ID such as `"claude"`, `"codex"`, `"kimi"`, or `"pi"` |
 | `opts.includeMeta` | `boolean` | Include `is_meta=1` rows, default false |
+| `opts.includeInactive` | `boolean` | Include provider-attested superseded rows, default false |
 
 Pass the current session ID as `excludeSession` when searching history: the query
 terms usually come from the current prompt, so that prompt is a near-guaranteed
@@ -69,7 +70,7 @@ Returns:
 
 ```js
 Array<{
-  message: { uuid, text, content_type, is_meta, role, timestamp, model, cwd, source },
+  message: { uuid, text, content_type, is_meta, role, timestamp, model, cwd, visibility, source },
   session: { id, title, project, started_at, source },
   rank,
   context
@@ -77,6 +78,7 @@ Array<{
 ```
 
 `context` is temporal neighbor context in the same session, not a parent chain.
+Hits and neighbors carry `visibility`.
 Use `context(uuid)` or `trace(uuid)` for causal/parent-chain expansion. Lower
 FTS rank sorts earlier; prefer returned order unless deliberately inspecting
 FTS ranking.
@@ -86,13 +88,14 @@ malformed (for example a hyphenated term like `foo-bar`) does not error: it
 falls back to safe per-token quoting — the same tokenization `memories()` uses —
 so ordinary text never crashes the query.
 
-#### `context(uuid)`
+#### `context(uuid, opts?)`
 
 Full indexed context around one message.
 
 | Param | Type | Description |
 | --- | --- | --- |
 | `uuid` | `string` | Message UUID |
+| `opts.includeInactive` | `boolean` | Include a superseded target and ancestors, default false |
 
 Returns:
 
@@ -100,9 +103,11 @@ Returns:
 { message, parentChain, session, subagent, workflow } | null
 ```
 
-`parentChain` contains ancestors, not temporal neighbors. If the message belongs
+`message` and every returned ancestor carry `visibility`. `parentChain`
+contains ancestors, not temporal neighbors. If the message belongs
 to a subagent or workflow agent, `subagent` or `workflow` is populated when the
-metadata exists.
+metadata exists. Hidden targets always return `null`, and hidden ancestors are
+always omitted.
 
 #### `sql(query, ...params)`
 
@@ -181,7 +186,7 @@ Returns:
     projects,
     sessions,
     memories,
-    sources: [{ source: 'claude' | 'codex', session_count, last_session_at }]
+    sources: [{ source: 'claude' | 'codex' | 'kimi' | 'pi', session_count, last_session_at }]
   }
 }
 ```
@@ -200,11 +205,13 @@ Session rows ordered by `ended_at` descending. Passing a number is treated as
 | `opts.before` | `string` | ISO upper bound on `started_at` |
 | `opts.limit` | `number` | Max rows, default 50 |
 | `opts.branch` | `string` | Exact git branch |
-| `opts.source` | `string` | `"claude"`, `"codex"`, or omitted/all |
+| `opts.source` | `string` | Provider ID such as `"claude"`, `"codex"`, `"kimi"`, or `"pi"`; omit for all |
 | `opts.sessionId` | `string` | Exact session ID |
 | `opts.sessions` | `string[]` | Restrict to session IDs |
 
 Returns `Array<session_row>`.
+`message_count` describes the visible canonical transcript; inactive and hidden
+records do not increase it.
 
 `title` is derived when the transcript has none: current Claude Code versions
 rarely emit a session title, so `sessions()`, `overview()`, and `search()` fall
@@ -233,6 +240,7 @@ is treated as `sessionId`; passing a number is treated as `limit`.
 | `opts.branch` | `string` | Exact source session branch |
 | `opts.source` | `string` | Provider filter through joined session |
 | `opts.limit` | `number` | Max rows, default 100 |
+| `opts.includeInactive` | `boolean` | Include superseded summaries, default false |
 
 Returns:
 
@@ -241,7 +249,10 @@ Array<summary_row & { session_title, project }>
 ```
 
 `summaries.source` is the summary kind, such as `away_summary`; it is not the
-provider source.
+provider source. `input_tokens` and `output_tokens` contain normalized usage
+when the provider performed a separate model call for that summary.
+Rows carry `visibility`. Inactive summaries describe work that was tried and
+then superseded. Hidden summaries are never returned.
 
 #### `memories(opts?)`
 
@@ -276,11 +287,13 @@ full content.
 
 ## Structural Expansion Helpers
 
-#### `trace(uuid)`
+#### `trace(uuid, opts?)`
 
 Walk the `parent_uuid` chain from a message to the conversation root.
 
-Returns `Array<message>` ordered root-first.
+Pass `{ includeInactive: true }` to follow a superseded path. Returns labeled
+messages ordered root-first. A hidden target returns an empty array, and hidden
+ancestors are omitted.
 
 #### `thread(sessionId, opts?)`
 
@@ -290,30 +303,34 @@ Messages in a session ordered by timestamp.
 | --- | --- | --- |
 | `sessionId` | `string` | Session ID |
 | `opts.includeMeta` | `boolean` | Include injected/control-plane rows, default false |
+| `opts.includeInactive` | `boolean` | Include superseded messages, default false |
 
 Returns `Array<message>`. Use `thread()` as a last resort; prefer targeted
 search/context or compact SQL projections.
 
 #### `raw(uuid, opts?)`
 
-Windowed access to the original JSONL line for one indexed message. Use this
-when indexed text, tool inputs, or tool results were truncated and you need the
-raw source.
+Windowed access to the source record for one indexed message, normally its
+original JSONL line. Use this when indexed text, tool inputs, or tool results
+were truncated and you need the raw source. Pi returns the selected source
+message object for both direct and retained-tail storage, so one physical
+compaction line never exposes other retained messages.
 
 | Param | Type | Description |
 | --- | --- | --- |
 | `uuid` | `string` | Message UUID |
 | `opts.offset` | `number` | Character offset into the JSONL line, default 0 |
 | `opts.limit` | `number` | Max characters, default 10000 |
+| `opts.includeInactive` | `boolean` | Allow a superseded target, default false |
 
 Returns:
 
 ```js
-{ text, totalLength, offset, limit, hasMore } | null
+{ text, totalLength, offset, limit, hasMore, visibility } | null
 ```
 
 `raw()` resolves main-session, subagent, workflow-agent, and Codex JSONL paths
-from indexed metadata.
+from indexed metadata. Hidden targets always return `null`.
 
 ---
 
@@ -380,6 +397,7 @@ well as `Edit`/`Write`.
 | `opts.before` | `string` | ISO upper bound |
 | `opts.source` | `string` | Provider filter |
 | `opts.limit` | `number` | Max rows, default 200 |
+| `opts.includeInactive` | `boolean` | Include superseded tool evidence, default false |
 
 Returns:
 
@@ -387,7 +405,8 @@ Returns:
 Array<{
   toolCall: { id, message_uuid, name, input_json },
   session: { id, title, project },
-  timestamp
+  timestamp,
+  visibility
 }>
 ```
 
@@ -407,11 +426,12 @@ the failure. Passing a string is treated as `sessionId`.
 | `opts.before` | `string` | ISO upper bound on result message timestamp |
 | `opts.source` | `string` | Provider filter |
 | `opts.limit` | `number` | Max rows, default 50 |
+| `opts.includeInactive` | `boolean` | Include superseded failures and neighbors, default false |
 
 Returns:
 
 ```js
-Array<{ toolCall, result, session, nextMessages }>
+Array<{ toolCall, result, session, nextMessages, visibility }>
 ```
 
 Use SQL for precise counts and grouping; treat `failures()` as compact evidence,

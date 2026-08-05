@@ -7,6 +7,6 @@ test('canonical transcript persistence schema changes only by explicit decision'
   const schema = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url));
   assert.equal(
     createHash('sha256').update(schema).digest('hex'),
-    'ef5d0eea6f91c50e78ca5e28ecdc7b3ed5db83db59200642cc25866158f9d307',
+    'f5bbc43b653090b40be6964834d893ebb8d67e4e198311c53a69e1871ce41701',
   );
 });
