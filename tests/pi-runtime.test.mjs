@@ -157,7 +157,7 @@ test('CLI force rebuild rejects a structurally invalid Pi snapshot and preserves
     }),
     '',
   ].join('\n'));
-  const failed = runCli(['--build'], { home, env });
+  const failed = runCli(['--rebuild'], { home, env });
   assert.equal(failed.status, 1, failed.stderr || failed.stdout);
   assert.match(JSON.parse(failed.stdout).error, /provider_failure/);
 
@@ -191,7 +191,7 @@ test('malformed official Pi settings use Pi 0.83 default-root fallback', () => {
   lure[0] = { ...lure[0], id: 'default-lure', cwd: '/tmp/default-lure' };
   writeFileSync(defaultPath, `${lure.map(record => JSON.stringify(record)).join('\n')}\n`);
   writeFileSync(settingsPath, '{broken');
-  const rebuilt = runCli(['--build'], { home, env });
+  const rebuilt = runCli(['--rebuild'], { home, env });
   assert.equal(rebuilt.status, 0, rebuilt.stderr || rebuilt.stdout);
 
   const db = new DatabaseSync(join(home, '.obelisk', 'obelisk.sqlite'), { readOnly: true });

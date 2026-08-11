@@ -1,9 +1,12 @@
 // Phase 5b-2b: verifies incremental (resume) indexing through the full rewired
 // buildIndex path (needsReindex → cursor → claude.parse → persist). A force
-// --build re-scans everything (skip=0) and never exercises resume, so this
+// --rebuild re-scans everything (skip=0) and never exercises resume, so this
 // appends new lines to an already-indexed session and drives an incremental
 // build. The 30s shouldSkipBuild debounce is cleared between steps (it would
 // otherwise skip a build this soon after the previous one).
+//
+// The last two tests pin the split between the verbs: --build is incremental
+// and additive, --rebuild is the only destructive path.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -66,7 +69,7 @@ test('incremental buildIndex resumes from cursor and accumulates message_count',
   assert.equal(afterAppend.lp, 4, 'cursor advanced to 4 lines');
 });
 
-test('force build purges sessions for deleted files and preserves memories', () => {
+test('--rebuild purges sessions for deleted files and preserves memories', () => {
   const home = mkdtempSync(join(tmpdir(), 'obelisk-force-'));
   const projDir = join(home, '.claude', 'projects', '-tmp-proj');
   mkdirSync(projDir, { recursive: true });
@@ -83,10 +86,10 @@ test('force build purges sessions for deleted files and preserves memories', () 
   assert.equal(db.prepare('SELECT COUNT(*) c FROM sessions').get().c, 2, 'both sessions indexed initially');
   db.close();
 
-  // Delete one transcript, then force a clean rebuild (`--build` is always force).
+  // Delete one transcript, then force a clean rebuild (`--rebuild` only).
   rmSync(gone);
   clearBuildDebounce(home);
-  assert.equal(runRuntime(['--build'], home).status, 0);
+  assert.equal(runRuntime(['--rebuild'], home).status, 0);
 
   db = new DatabaseSync(dbPath);
   const sessionIds = db.prepare('SELECT id FROM sessions ORDER BY id').all().map(r => r.id);
@@ -97,4 +100,30 @@ test('force build purges sessions for deleted files and preserves memories', () 
   assert.deepEqual(sessionIds, ['keep'], 'stale session for the deleted file is purged');
   assert.equal(messageCount, 1, 'only the surviving file\'s message remains');
   assert.equal(memoryAlive, 1, 'the durable memory survived the force rebuild');
+});
+
+test('--build keeps sessions whose transcript is gone and still indexes new ones', () => {
+  const home = mkdtempSync(join(tmpdir(), 'obelisk-build-additive-'));
+  const projDir = join(home, '.claude', 'projects', '-tmp-proj');
+  mkdirSync(projDir, { recursive: true });
+  writeFileSync(join(projDir, 'keep.jsonl'), line('k1', 'user', '2026-06-10T10:00:00Z') + '\n');
+  writeFileSync(join(projDir, 'gone.jsonl'), line('g1', 'user', '2026-06-10T10:00:00Z') + '\n');
+  assert.equal(runRuntime(['--build'], home).status, 0);
+
+  // The transcript disappears (a provider-side retention window expiring), and a
+  // new one arrives. The debounce is deliberately NOT cleared: an explicitly
+  // invoked --build must still run.
+  rmSync(join(projDir, 'gone.jsonl'));
+  writeFileSync(join(projDir, 'fresh.jsonl'), line('f1', 'user', '2026-06-10T10:02:00Z') + '\n');
+  assert.equal(runRuntime(['--build'], home).status, 0);
+
+  const db = new DatabaseSync(join(home, '.obelisk', 'obelisk.sqlite'), { readOnly: true });
+  const sessionIds = db.prepare('SELECT id FROM sessions ORDER BY id').all().map(r => r.id);
+  db.close();
+
+  assert.deepEqual(
+    sessionIds,
+    ['fresh', 'gone', 'keep'],
+    '--build is additive: the deleted transcript keeps its rows and the new one is indexed',
+  );
 });

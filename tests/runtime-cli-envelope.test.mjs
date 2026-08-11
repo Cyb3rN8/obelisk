@@ -3,7 +3,8 @@
 // These lock the four-verb CLI I/O envelope at the process boundary so the
 // upcoming TypeScript / runtime-core refactor cannot silently change what an
 // agent (through the CLI or a future MCP transport) observes on stdout:
-//   --build   -> { ok: true, db }
+//   --build   -> { ok: true, db }   (incremental)
+//   --rebuild -> { ok: true, db }   (force; same envelope, destructive path)
 //   --search  -> JSON array
 //   --query   -> pretty-printed JSON result, or { error, stack } + exit 1 on throw
 //   --attune  -> pretty-printed JSON result, or { error, stack } + exit 1 on throw
@@ -38,6 +39,16 @@ test('--build emits { ok: true, db } pointing at the resolved db path', () => {
     payload.db.endsWith(join('.obelisk', 'obelisk.sqlite')),
     `db path should resolve under HOME/.obelisk, got ${payload.db}`,
   );
+});
+
+test('--rebuild emits the same { ok: true, db } envelope as --build', () => {
+  const home = tempHome();
+  const result = runRuntime(['--rebuild'], { home });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.ok, true);
+  assert.equal(typeof payload.db, 'string');
 });
 
 test('--search emits a JSON array envelope', () => {

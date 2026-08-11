@@ -35,6 +35,9 @@ interface BuildCheckOptions {
 
 interface BuildIndexOptions {
   force?: boolean;
+  // An explicitly invoked build should run now, not answer "recently built".
+  // Defaults to `force` so passive callers keep the 30s debounce.
+  ignoreRecentBuild?: boolean;
   providerRegistry?: ProviderRegistry;
 }
 
@@ -83,11 +86,11 @@ function isMissingIndexStateTable(error: unknown): boolean {
   return /no such table:\s*(?:main\.)?index_state\b/i.test(message);
 }
 
-function inspectBuildOwnership({ force = false }: { force?: boolean } = {}) {
+function inspectBuildOwnership({ ignoreRecentBuild = false }: { ignoreRecentBuild?: boolean } = {}) {
   if (!existsSync(DB_PATH)) return { skip: false };
   const db = openReadDb();
   try {
-    return shouldSkipBuild(db, { ignoreRecentBuild: force });
+    return shouldSkipBuild(db, { ignoreRecentBuild });
   } catch (error) {
     // A missing table means the write path must initialize a new/legacy index.
     // Any other read failure leaves daemon ownership unknown, so fail closed.
@@ -98,8 +101,8 @@ function inspectBuildOwnership({ force = false }: { force?: boolean } = {}) {
   }
 }
 
-function buildIndex({ force = false, providerRegistry }: BuildIndexOptions = {}) {
-  const ownership = inspectBuildOwnership({ force });
+function buildIndex({ force = false, ignoreRecentBuild = force, providerRegistry }: BuildIndexOptions = {}) {
+  const ownership = inspectBuildOwnership({ ignoreRecentBuild });
   if (ownership.skip) return ownership;
   const lease = acquireWriterLease({
     lockPath: writerLockPathFor(DB_PATH),
@@ -108,7 +111,7 @@ function buildIndex({ force = false, providerRegistry }: BuildIndexOptions = {})
   if (!lease) return { skip: true, reason: 'writer_busy' };
   try {
     // Ownership may change between the first read and lease acquisition.
-    const ownershipAfterLease = inspectBuildOwnership({ force });
+    const ownershipAfterLease = inspectBuildOwnership({ ignoreRecentBuild });
     if (ownershipAfterLease.skip) return ownershipAfterLease;
     let registry = providerRegistry;
     if (registry === undefined) {

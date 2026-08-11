@@ -12,6 +12,35 @@ import {
   executeAttune,
 } from '../../core/src/core.ts';
 
+interface BuildResult {
+  skip?: boolean;
+  complete?: boolean;
+  reason?: string;
+  error?: string;
+  inventoryIssues?: { provider?: unknown; path?: unknown; error?: unknown }[];
+}
+
+// Write-ownership skips leave the existing index untouched and heal on the next
+// command, so they are an outcome to report — not a failure to fix.
+const BENIGN_BUILD_SKIPS = new Set(['daemon_active', 'recent_build', 'writer_busy', 'database_busy']);
+
+function buildFailure(force: boolean, result: BuildResult): Error {
+  const issue = result.inventoryIssues?.[0];
+  let detail = '';
+  if (typeof result.error === 'string') {
+    detail = ` (${result.error})`;
+  } else if (
+    issue
+    && typeof issue.provider === 'string'
+    && typeof issue.path === 'string'
+    && typeof issue.error === 'string'
+  ) {
+    detail = ` (${issue.provider} at ${issue.path}: ${issue.error})`;
+  }
+  const verb = force ? 'rebuild' : 'build';
+  return new Error(`Index ${verb} was not published: ${result.reason ?? 'incomplete_snapshot'}${detail}`);
+}
+
 async function main() {
   const args = process.argv.slice(2);
   const fail = (value: unknown): void => {
@@ -30,30 +59,26 @@ async function main() {
     process.stdout.write(`${packageJson.version}\n`);
     return;
   }
-  if (args[0] === '--build') {
+  // `--build` refreshes incrementally: sessions whose transcript has since been
+  // deleted keep their indexed rows. `--rebuild` is the destructive path — it
+  // empties every indexed table and republishes only what is still readable on
+  // disk, so anything the providers can no longer see is gone for good.
+  if (args[0] === '--build' || args[0] === '--rebuild') {
+    const force = args[0] === '--rebuild';
     try {
-      const result = buildIndex({ force: true });
-      if (!('complete' in result) || result.complete !== true) {
-        const reason = 'reason' in result && typeof result.reason === 'string'
-          ? result.reason
-          : 'incomplete_snapshot';
-        const issue = 'inventoryIssues' in result && Array.isArray(result.inventoryIssues)
-          ? result.inventoryIssues[0] as { provider?: unknown; path?: unknown; error?: unknown } | undefined
-          : undefined;
-        let detail = '';
-        if ('error' in result && typeof result.error === 'string') {
-          detail = ` (${result.error})`;
-        } else if (
-          issue
-          && typeof issue.provider === 'string'
-          && typeof issue.path === 'string'
-          && typeof issue.error === 'string'
-        ) {
-          detail = ` (${issue.provider} at ${issue.path}: ${issue.error})`;
-        }
-        throw new Error(`Index rebuild was not published: ${reason}${detail}`);
-      }
-      process.stdout.write(JSON.stringify({ ok: true, db: DB_PATH }) + '\n');
+      const result = buildIndex({ force, ignoreRecentBuild: true }) as BuildResult;
+      // A force run publishes one complete snapshot or nothing, so anything
+      // short of complete failed. An incremental run only fails when it could
+      // not run at all for a reason the operator has to fix.
+      const failed = force
+        ? result.complete !== true
+        : result.skip === true && !BENIGN_BUILD_SKIPS.has(result.reason ?? '');
+      if (failed) throw buildFailure(force, result);
+      process.stdout.write(JSON.stringify({
+        ok: true,
+        db: DB_PATH,
+        ...(result.skip === true ? { skipped: result.reason } : {}),
+      }) + '\n');
     } catch (error) { fail(error); }
     return;
   }
@@ -84,7 +109,7 @@ async function main() {
     }
     return;
   }
-  process.stderr.write('Usage:\n  obelisk install [skills options]\n  obelisk --build\n  obelisk --search "text"\n  obelisk --query <file.js>\n  obelisk --attune <file.js>\n');
+  process.stderr.write('Usage:\n  obelisk install [skills options]\n  obelisk --build\n  obelisk --rebuild            (destructive: drops the index and re-reads only\n                               transcripts still on disk)\n  obelisk --search "text"\n  obelisk --query <file.js>\n  obelisk --attune <file.js>\n');
   process.exitCode = 1;
 }
 
