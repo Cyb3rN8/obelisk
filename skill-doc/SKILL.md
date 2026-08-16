@@ -29,6 +29,87 @@ Obelisk is a CodeAct memory layer: write a small JS query, run it locally, read
 the JSON, then answer. Do not turn history into a flat document or browse entire
 sessions by default.
 
+## Execution Mode
+
+LOCAL: this section is a local convention for harnesses that can delegate to
+sub-agents. Do not upstream it.
+
+Obelisk work is iterative — write a script, run it, read JSON, retry — and the
+intermediate rounds are noise unless someone needs them. Before the first
+query, decide where to run by asking: **does the intermediate process have a
+consumer?** If only the conclusion matters, run this skill inside a sub-agent;
+if the process must be seen, steered, or persisted, stay in the main thread.
+
+Prefer a sub-agent when:
+
+- Only the answer matters ("how did we fix X", "find the session where...").
+- The main thread is mid-task and history is a side lookup (proactive
+  triggers: `fileHistory` before editing, "continue where we left off").
+- Retrieval is uncertain and likely needs several probe/retry rounds.
+- Broad synthesis: recap, weekly/monthly review, cross-session design history.
+- Several independent questions can fan out in parallel.
+- The main context is already long.
+
+Stay in the main thread when:
+
+- Recovering this session's own compacted context: you need verbatim turns,
+  and delegation inserts a lossy summary exactly where verbatim matters.
+- Finishing memory mutations: sub-agents cannot ask the user, so the
+  approve → Write → `--attune` tail always runs in the main thread. A
+  sub-agent may still retrieve and propose.
+- The query is a known single-shot pattern (≤2 tool rounds): agent overhead
+  costs more than it saves.
+- The user is interactively steering the exploration turn by turn.
+- The research process itself is the deliverable (e.g. developing a reusable
+  query script, or working on this skill).
+
+The usual shape is hybrid: the sub-agent absorbs probing, reference reading,
+and bulky JSON; the main thread keeps approval, verbatim recall, and steering.
+
+**Dispatch contract** — the sub-agent prompt must carry what only the main
+thread knows:
+
+1. The main session's `session_id`, for `excludeSession` — the main prompt
+   contains the search terms and may already be indexed.
+2. The user's verbatim wording. Do not pre-translate: trigram searches the
+   user's language directly, and the native/topic dual probe needs the
+   original.
+3. The decision the main thread is about to make, so evidence is projected
+   onto that decision instead of summarized generically.
+4. An explicit instruction to use the /obelisk skill, plus the report
+   skeleton below as the expected output shape.
+
+**Report contract** — handoff is lossy; stable IDs make the loss recoverable:
+
+```markdown
+## Conclusion
+Direct answer, 2-6 sentences.
+
+## Evidence
+- [session_id · uuid] "verbatim snippet ≤240 chars" — what it supports
+  (every load-bearing claim carries a verbatim quote, never a paraphrase)
+
+## Coverage
+- Terms and scopes probed (both languages), with explicit empty results —
+  distinguish "not found" from "not searched"; trigram returns silent zeros.
+- Known blind spots (sources, time ranges not covered).
+
+## Memory proposals (optional)
+- Draft summary + message_start/end + anchors; the main thread seeks user
+  approval, then runs --attune.
+
+## Drill-down (optional)
+- context('<uuid>') / thread('<session_id>') entry points for follow-up.
+```
+
+Keep the report at or under the same 10k-12k char budget as query JSON: the
+sub-agent's job is to digest the bulky JSON, not relay it.
+
+LOCAL model tiering: routine retrieval sub-agents run `sonnet`; broad
+synthesis or verdict-heavy runs (recap, cross-session qualitative
+conclusions) run `opus`; never `haiku` — no deterministic post-check can
+catch retrieval errors.
+
 ## Quick Start
 
 Fast keyword search:
