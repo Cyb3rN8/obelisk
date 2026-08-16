@@ -243,7 +243,15 @@ export function resolveInvokingSessionIdWithWait(
   providerRegistry: ProviderRegistry,
   {
     openRead = openReadDb,
-    build = () => buildIndex({ ignoreRecentBuild: true, ignoreDaemonOwnership: true, providerRegistry }),
+    // LOCAL（不上游）：OBELISK_NONCE_RECOVERY=poll 时 recovery build 仍受 daemon
+    // 所有权约束——心跳新鲜则快速 skip（daemon_active），只留下方有界 poll，不再
+    // 在查询进程内跑全量增量 build（本机 corpus 一次 ~50s）。env 未设或心跳过期
+    // 时维持上游 ADR 0006 carve-out 原行为。默认值由 CLI wrapper 注入。
+    build = () => buildIndex({
+      ignoreRecentBuild: true,
+      ignoreDaemonOwnership: process.env.OBELISK_NONCE_RECOVERY !== 'poll',
+      providerRegistry,
+    }),
     pollIntervalMs = INVOCATION_POLL_INTERVAL_MS,
     pollCapMs = INVOCATION_POLL_CAP_MS,
     resolveOpts,
