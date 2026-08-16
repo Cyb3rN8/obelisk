@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 import type { SqliteDb } from './sqlite-types.ts';
 
 const COLUMN_MIGRATIONS = [
@@ -93,6 +96,20 @@ export function migrateFtsTokenizer(db: SqliteDb, tokenizer: string | null): voi
     // External content tables hold no data of their own; repopulate from the content table.
     db.exec(`INSERT INTO ${table}(${table}) VALUES('rebuild')`);
   }
+}
+
+export function coreSchemaNeedsMigration(db: SqliteDb): boolean {
+  const columnsByTable = new Map<string, Set<string>>();
+  for (const [table, column] of COLUMN_MIGRATIONS) {
+    if (!tableExists(db, table)) return true;
+    let columns = columnsByTable.get(table);
+    if (!columns) {
+      columns = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((row) => String(row.name)));
+      columnsByTable.set(table, columns);
+    }
+    if (!columns.has(column)) return true;
+  }
+  return false;
 }
 
 /** Binding-agnostic additive migrations shared by the CLI and desktop app. */

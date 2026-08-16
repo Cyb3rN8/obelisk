@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Claude Code provider adapter in Core (see docs/adr/0001).
 //
 // Pure: discovers Claude transcript files and parses one into a record stream.
@@ -180,7 +183,6 @@ function toolResultText(content: unknown): string {
 function workflowParentToolUseId(
   transcriptPath: string,
   runId: string,
-  workflowName: string | null,
 ): string | null {
   if (!existsSync(transcriptPath)) return null;
   const workflowToolIds = new Set<string>();
@@ -202,7 +204,7 @@ function workflowParentToolUseId(
     for (const block of content) {
       if (block?.type !== 'tool_result' || !workflowToolIds.has(block.tool_use_id)) continue;
       const text = toolResultText(block.content);
-      if (!text.includes(runId) && !(workflowName && text.includes(workflowName))) continue;
+      if (!text.includes(runId)) continue;
       parentToolUseId = block.tool_use_id;
       return false;
     }
@@ -226,7 +228,6 @@ function* parseWorkflow(unit: IndexUnit): Generator<TranscriptRecord, Cursor> {
     parent_tool_use_id: workflowParentToolUseId(
       meta.mainTranscriptPath,
       workflow.runId,
-      workflow.workflowName || null,
     ),
     task_id: workflow.taskId || null,
     script: workflow.script || null,

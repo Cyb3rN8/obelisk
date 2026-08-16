@@ -1,22 +1,25 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Phase 5b golden test: pins the claude adapter's parse() record stream.
 // This is the binding-independent contract — no database is involved. If the
 // per-line parse behavior drifts, this fails before persist ever runs.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, statSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, readFileSync, writeFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
 import { createClaudeProvider, parse } from '../packages/core/src/providers/claude.ts';
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
 import { persist } from '../packages/core/src/persist.ts';
+import { makeTempDir } from './temp-dirs.mjs';
 
 const SCHEMA = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
 
 function writeFixture() {
-  const dir = mkdtempSync(join(tmpdir(), 'obelisk-claude-parse-'));
+  const dir = makeTempDir('obelisk-claude-parse-');
   const path = join(dir, 'sid-x.jsonl');
   const lines = [
     { type: 'ai-title', aiTitle: 'My Session' },
@@ -101,7 +104,7 @@ test('claude parse() resumes from a cursor, skipping already-indexed lines', () 
 });
 
 test('claude provider emits workflow artifacts with an explicit canonical tool edge', () => {
-  const root = mkdtempSync(join(tmpdir(), 'obelisk-claude-workflow-'));
+  const root = makeTempDir('obelisk-claude-workflow-');
   const projectDir = join(root, 'projects', '-proj');
   const workflowDir = join(projectDir, 'sid-workflow', 'workflows');
   const workflowAgentDir = join(projectDir, 'sid-workflow', 'subagents', 'workflows', 'run-workflow');
@@ -161,4 +164,50 @@ test('claude provider emits workflow artifacts with an explicit canonical tool e
   });
   assert.deepEqual(persistedDetail, detail);
   db.close();
+});
+
+test('claude links repeated workflow names by unique run id', () => {
+  const root = makeTempDir('obelisk-claude-workflow-link-');
+  const projectDir = join(root, 'projects', '-proj');
+  const workflowDir = join(projectDir, 'sid-workflow', 'workflows');
+  mkdirSync(workflowDir, { recursive: true });
+  writeFileSync(join(projectDir, 'sid-workflow.jsonl'), [
+    {
+      uuid: 'assistant-old', type: 'assistant',
+      message: { role: 'assistant', content: [{ type: 'tool_use', id: 'old-call', name: 'Workflow', input: {} }] },
+    },
+    {
+      uuid: 'old-result', type: 'user',
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'old-call', content: 'Run ID: old-run\nSummary: same-name' }] },
+    },
+    {
+      uuid: 'assistant-new', type: 'assistant',
+      message: { role: 'assistant', content: [{ type: 'tool_use', id: 'new-call', name: 'Workflow', input: {} }] },
+    },
+    {
+      uuid: 'new-result', type: 'user',
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'new-call', content: 'Run ID: new-run\nSummary: same-name' }] },
+    },
+  ].map(line => JSON.stringify(line)).join('\n') + '\n');
+  for (const runId of ['old-run', 'new-run']) {
+    writeFileSync(join(workflowDir, `${runId}.json`), JSON.stringify({
+      runId, workflowName: 'same-name', status: 'completed', workflowProgress: [],
+    }));
+  }
+
+  const provider = createClaudeProvider({ rootDir: root });
+  const workflowUnits = provider.discover({ lastCursor: () => null })
+    .filter(unit => unit.meta?.kind === 'workflow');
+  assert.equal(workflowUnits.length, 2);
+
+  // Both runs share the workflow name, so name-based matching would attach the
+  // newer run to the older call; each run must link by its unique run id.
+  const parentByRun = new Map();
+  for (const unit of workflowUnits) {
+    const records = drain(provider.parse(unit, null)).values;
+    const workflow = records.find(record => record.kind === 'workflow');
+    parentByRun.set(workflow.run_id, workflow.parent_tool_use_id);
+  }
+  assert.equal(parentByRun.get('old-run'), 'old-call');
+  assert.equal(parentByRun.get('new-run'), 'new-call');
 });

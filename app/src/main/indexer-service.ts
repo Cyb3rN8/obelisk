@@ -1,3 +1,6 @@
+// Copyright (C) 2026 tommy0103 and contributors.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -9,6 +12,7 @@ const DEFAULT_STABILITY_MS = 500;
 const DEFAULT_HEARTBEAT_MS = 30000;
 const DEFAULT_WATCH_RETRY_MS = 5000;
 const DEFAULT_DEFERRED_RETRY_MS = 250;
+const MAX_INVENTORY_RETRY_MS = 10 * 60 * 1000;
 
 type TimerHandle = ReturnType<typeof setTimeout>;
 
@@ -136,7 +140,7 @@ function createIndexerService({
   let stabilityTimer: TimerHandle | null = null;
   let heartbeatTimer: TimerHandle | null = null;
   let watchRetryTimer: TimerHandle | null = null;
-  let deferredRetryTimer: TimerHandle | null = null;
+  let retryTimer: TimerHandle | null = null;
   let watcher: Watcher | null = null;
   let stopped = false;
   let running = false;
@@ -144,6 +148,7 @@ function createIndexerService({
   let lastReason: string | null = null;
   let changedPaths = new Set<string>();
   let fullInventoryPending = false;
+  let nextInventoryRetryMs = heartbeatMs;
   let idlePromise = Promise.resolve();
 
   const requestFullInventory = () => {
@@ -200,16 +205,28 @@ function createIndexerService({
           );
         }
       }
-      if (result?.deferred) {
-        if (buildChangedPaths === undefined) requestFullInventory();
+      const incompleteInventory = (result?.inventoryIssues?.length ?? 0) > 0;
+      if (!result?.deferred && !incompleteInventory && buildChangedPaths === undefined) {
+        nextInventoryRetryMs = heartbeatMs;
+      }
+      if (result?.deferred || incompleteInventory) {
+        if (incompleteInventory || buildChangedPaths === undefined) requestFullInventory();
         else addChangedPath(buildChangedPaths);
-        if (!stopped && !deferredRetryTimer) {
-          deferredRetryTimer = timers.setTimeout(() => {
-            deferredRetryTimer = null;
-            runBuildNow('writer-lease');
-          }, deferredRetryMs);
+        if (!stopped && !retryTimer) {
+          const retryReason = result?.deferred ? 'writer-lease' : 'incomplete-inventory';
+          const retryMs = result?.deferred ? deferredRetryMs : nextInventoryRetryMs;
+          retryTimer = timers.setTimeout(() => {
+            retryTimer = null;
+            runBuildNow(retryReason);
+          }, retryMs);
+          if (!result?.deferred) {
+            nextInventoryRetryMs = Math.min(nextInventoryRetryMs * 2, Math.max(
+              heartbeatMs,
+              MAX_INVENTORY_RETRY_MS,
+            ));
+          }
         }
-        return;
+        if (result?.deferred) return;
       }
       publishHeartbeat();
     })()
@@ -234,8 +251,8 @@ function createIndexerService({
     else addChangedPath(changedPath);
     lastReason = reason;
     if (running) pending = true;
-    if (deferredRetryTimer) timers.clearTimeout(deferredRetryTimer);
-    deferredRetryTimer = null;
+    if (retryTimer) timers.clearTimeout(retryTimer);
+    retryTimer = null;
     if (buildTimer) timers.clearTimeout(buildTimer);
     if (stabilityTimer) timers.clearTimeout(stabilityTimer);
     buildTimer = timers.setTimeout(() => {
@@ -294,8 +311,9 @@ function createIndexerService({
     stabilityTimer = null;
     if (watchRetryTimer) timers.clearTimeout(watchRetryTimer);
     watchRetryTimer = null;
-    if (deferredRetryTimer) timers.clearTimeout(deferredRetryTimer);
-    deferredRetryTimer = null;
+    if (retryTimer) timers.clearTimeout(retryTimer);
+    retryTimer = null;
+    nextInventoryRetryMs = heartbeatMs;
     if (heartbeatTimer && typeof timers.clearInterval === 'function') timers.clearInterval(heartbeatTimer);
     heartbeatTimer = null;
     if (watcher?.close) watcher.close();
