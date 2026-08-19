@@ -105,7 +105,9 @@ test('force build keeps the wholesale rebuild and re-records the marker it wiped
       .run(999999, 'poison', 'sess', 'poisonword');
   });
   clearBuildDebounce(home);
-  assert.equal(runCli(['--build'], { home }).status, 0);
+  // LOCAL: --build is incremental here; --rebuild is the force path (upstream
+  // spells it --build). AGENTS.md's standing rule for force-semantics tests.
+  assert.equal(runCli(['--rebuild'], { home }).status, 0);
 
   withDb(home, (db) => {
     assert.equal(ftsHits(db, 'poisonword'), 0, 'the force build regenerated the index from the content table');
