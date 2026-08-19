@@ -125,8 +125,12 @@ Custom query:
    your invocation nonce:
 
    ```bash
-   qfile=$(mktemp /tmp/obq.XXXXXX 2>/dev/null || echo "/tmp/obq.$$.$RANDOM.mjs")
+   qdir=$(mktemp -d /tmp/obq.XXXXXX 2>/dev/null || { d="/tmp/obq.$$.$RANDOM"; mkdir "$d"; echo "$d"; })
+   qfile="$qdir/query.mjs"
    ```
+
+   The `.mjs` name lives inside the unique directory, so the `mktemp`
+   template always ends on the `X` run (BSD `mktemp` requires that).
 
 2. Run:
 
