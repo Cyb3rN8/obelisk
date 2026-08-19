@@ -91,7 +91,8 @@ Direct answer, 2-6 sentences.
 
 ## Coverage
 - Terms and scopes probed (both languages), with explicit empty results —
-  distinguish "not found" from "not searched"; trigram returns silent zeros.
+  distinguish "not found" from "not searched"; note any `degraded` hits
+  (short-term queries fall back to substring scans without FTS ranking).
 - Known blind spots (sources, time ranges not covered).
 
 ## Memory proposals (optional)
@@ -171,8 +172,14 @@ const project = map.current.project?.project;
 const self = 'current session_id';  // the session you are running in
 // LOCAL: this index uses the trigram tokenizer, so the user's own language is
 // searchable directly — do not translate before searching. Probe both; each
-// search is ~1ms. Trigram needs >=3 characters; for shorter terms use sql()
-// with LIKE. Probe one term per search: spaces are an implicit AND, so
+// search is ~1ms. Terms under 3 characters are handled by search() itself:
+// mixed with longer terms they are enforced as literal substrings
+// (degraded: 'short-token-post-filter'), and an all-short query LIKE-scans
+// the content table (degraded: 'like-scan', rank null, recency-ordered).
+// Prefer >=3-char phrases anyway — degraded paths cost more and the all-short
+// one loses FTS ranking. Hits carry a hit-centered `snippet`; quote it instead
+// of slicing text from the head (long messages match far past the front).
+// Probe one term per search: spaces are an implicit AND, so
 // '劳务分包 同意函' requires both phrases in the same message and usually
 // over-narrows. Split long CJK phrases into separate searches instead.
 const native = 'verbatim phrase from the user request, >=3 chars';

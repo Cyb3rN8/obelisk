@@ -140,6 +140,22 @@ function syncMessagesFtsOnce(db: SqliteDb): void {
   markMessagesFtsSynced(db);
 }
 
+// LOCAL: same one-time-heal pattern for tool_errors_fts. persist upserts
+// tool_results (stable rowid, AU trigger fires), so the schema triggers keep
+// the table truthful; the wholesale rowid-aligned refresh runs once to heal
+// rows written before trigger maintenance. Not written by the force path —
+// force wipes index_state, and the next incremental finalize self-heals.
+const TOOL_ERRORS_FTS_SYNC_MARKER = '__tool_errors_fts_synced__';
+
+function syncToolErrorsFtsOnce(db: SqliteDb): void {
+  const done = db.prepare('SELECT jsonl_path FROM index_state WHERE jsonl_path = ?').get(TOOL_ERRORS_FTS_SYNC_MARKER);
+  if (done) return;
+  rebuildToolErrorsFts(db);
+  db.prepare(
+    "INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES (?, ?, 0)",
+  ).run(TOOL_ERRORS_FTS_SYNC_MARKER, Date.now());
+}
+
 function shouldSkipBuild(db: NodeSqliteDb, { now = Date.now(), ignoreRecentBuild = false, ignoreDaemonOwnership = false, ftsTokenizer = resolveFtsTokenizer() }: BuildCheckOptions = {}) {
   if (!ignoreDaemonOwnership) {
     const appHeartbeat = db.prepare("SELECT mtime FROM index_state WHERE jsonl_path='__app_heartbeat__'").get();
@@ -366,7 +382,7 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
           healWorkflowParentLinks(db);
           syncMessagesFtsOnce(db);
           rebuildMemoryFts(db);
-          rebuildToolErrorsFts(db);
+          syncToolErrorsFtsOnce(db);
           db.prepare("INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES ('__last_build__', ?, 0)").run(Date.now());
           writeProviderIndexMarkers(db, providerPlan, providerResult);
         }, { label: 'finalize' });

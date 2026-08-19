@@ -15,7 +15,7 @@ test('canonical transcript persistence schema changes only by explicit decision'
     // 2026-08-12: added the copyright/SPDX header comment; no schema change.
     // LOCAL: this branch also carries tool_errors_fts, so the pin diverges from
     // upstream's 4c686782... by exactly that table.
-    '65cc332c69ad5d10808768144cb88562819cd254963c9ca12dcee8ffd93da5d7',
+    '04313356f03832768eec51edfcea617243f9cd1611b1b39839cf429fb2bd5c44',
   );
 });
 

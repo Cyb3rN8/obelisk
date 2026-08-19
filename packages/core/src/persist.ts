@@ -35,7 +35,17 @@ function statements(db: SqliteDb) {
         input_tokens=excluded.input_tokens, output_tokens=excluded.output_tokens,
         cwd=excluded.cwd, skill=excluded.skill, source=excluded.source`),
     tc: db.prepare('INSERT OR REPLACE INTO tool_calls (id,message_uuid,session_id,name,presentation,input_json,file_path) VALUES (?,?,?,?,?,?,?)'),
-    tr: db.prepare('INSERT OR REPLACE INTO tool_results (tool_use_id,message_uuid,session_id,content,file_path,is_error) VALUES (?,?,?,?,?,?)'),
+    // LOCAL: upsert instead of INSERT OR REPLACE. REPLACE deletes-then-inserts
+    // (new rowid, no DELETE trigger without recursive_triggers), which is why
+    // tool_errors_fts historically needed a wholesale refresh. The upsert keeps
+    // the rowid stable and fires the UPDATE trigger, so the rowid-aligned
+    // tool_errors_fts triggers in schema.sql stay truthful row-by-row.
+    tr: db.prepare(`
+      INSERT INTO tool_results (tool_use_id,message_uuid,session_id,content,file_path,is_error)
+      VALUES (?,?,?,?,?,?)
+      ON CONFLICT(tool_use_id) DO UPDATE SET
+        message_uuid=excluded.message_uuid, session_id=excluded.session_id,
+        content=excluded.content, file_path=excluded.file_path, is_error=excluded.is_error`),
     sum: db.prepare('INSERT OR REPLACE INTO summaries (id,session_id,timestamp,source,content,visibility,input_tokens,output_tokens) VALUES (?,?,?,?,?,?,?,?)'),
     ses: db.prepare('INSERT OR REPLACE INTO sessions (id,title,project,project_path,started_at,ended_at,git_branch,version,message_count,jsonl_path,source) VALUES (?,?,?,?,?,?,?,?,?,?,?)'),
     sub: db.prepare(`

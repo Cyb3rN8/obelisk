@@ -61,18 +61,32 @@ END;
 -- because the model fixes the error instead of quoting it. Only is_error rows
 -- are indexed; they are 0.6% of tool_results by size.
 --
--- Deliberately not maintained by triggers: tool_results is written with
--- INSERT OR REPLACE, and REPLACE does not fire DELETE triggers unless
--- recursive_triggers is on, so a trigger pair would leak stale rows. The
--- indexer repopulates this table wholesale in finalize instead.
+-- LOCAL: maintained by the rowid-aligned triggers below since persist writes
+-- tool_results with an upsert (ON CONFLICT DO UPDATE keeps the rowid stable and
+-- fires the AU trigger — the historic INSERT OR REPLACE fired no DELETE trigger,
+-- which is why this table used to need a wholesale refresh every finalize).
+-- The indexer now refreshes it wholesale only once, under the
+-- __tool_errors_fts_synced__ marker, to heal pre-trigger rows.
 -- LOCAL: trigram is pinned here rather than left to OBELISK_FTS_TOKENIZER.
 -- That migration drops and recreates the table, which works for external-content
 -- tables (they repopulate from their content table) but would empty this one --
 -- it owns its rows. Declaring it here means a fresh index is correct from the
--- start, and the indexer's wholesale refresh keeps it that way.
+-- start.
 CREATE VIRTUAL TABLE IF NOT EXISTS tool_errors_fts USING fts5(
   tool_use_id UNINDEXED, session_id UNINDEXED, content,
   tokenize='trigram');
+CREATE TRIGGER IF NOT EXISTS tool_errors_fts_ai AFTER INSERT ON tool_results WHEN new.is_error = 1 BEGIN
+  INSERT INTO tool_errors_fts(rowid, tool_use_id, session_id, content)
+  VALUES (new.rowid, new.tool_use_id, new.session_id, new.content);
+END;
+CREATE TRIGGER IF NOT EXISTS tool_errors_fts_ad AFTER DELETE ON tool_results WHEN old.is_error = 1 BEGIN
+  DELETE FROM tool_errors_fts WHERE rowid = old.rowid;
+END;
+CREATE TRIGGER IF NOT EXISTS tool_errors_fts_au AFTER UPDATE ON tool_results BEGIN
+  DELETE FROM tool_errors_fts WHERE rowid = old.rowid;
+  INSERT INTO tool_errors_fts(rowid, tool_use_id, session_id, content)
+  SELECT new.rowid, new.tool_use_id, new.session_id, new.content WHERE new.is_error = 1;
+END;
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
 CREATE INDEX IF NOT EXISTS idx_messages_agent ON messages(agent_id);
 CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(session_id, timestamp);

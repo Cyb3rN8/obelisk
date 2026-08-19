@@ -141,15 +141,17 @@ function rebuildMemoryFts(db: SqliteDb): void {
 }
 
 /**
- * Repopulate the failed-tool-result index. This is a full refresh rather than
- * incremental bookkeeping: only `is_error` rows are indexed (a few thousand on a
- * large history), and `tool_results` is written with INSERT OR REPLACE, whose
- * implicit deletes do not fire DELETE triggers unless recursive_triggers is on.
+ * Repopulate the failed-tool-result index wholesale, rowid-aligned with
+ * tool_results so the schema triggers can maintain it row-by-row afterwards.
+ * LOCAL: persist now upserts tool_results (stable rowid, AU trigger fires), so
+ * this runs once per index — under the indexer's __tool_errors_fts_synced__
+ * marker — to heal rows written before trigger maintenance, instead of in
+ * every finalize.
  */
 function rebuildToolErrorsFts(db: SqliteDb): void {
   db.exec('DELETE FROM tool_errors_fts');
-  db.exec(`INSERT INTO tool_errors_fts (tool_use_id, session_id, content)
-    SELECT tool_use_id, session_id, content FROM tool_results WHERE is_error = 1`);
+  db.exec(`INSERT INTO tool_errors_fts (rowid, tool_use_id, session_id, content)
+    SELECT rowid, tool_use_id, session_id, content FROM tool_results WHERE is_error = 1`);
 }
 
 export { CLAUDE_DIR, CODEX_DIR, OBELISK_DIR, DB_PATH, TEXT_LIMIT, ATTUNE_MEMORY_COLUMNS, ATTUNE_MEMORY_TRIGGERS, openDb, openReadDb, openAttuneDb, probeAttuneMemoryLayer, openWriterLeaseDb, rebuildMemoryFts, rebuildToolErrorsFts, trunc, truncJson, extractText, extractContentType, extractMessageIsMeta, filePath, isDir, readLines };
