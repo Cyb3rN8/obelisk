@@ -7,9 +7,9 @@ import os from 'node:os';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
-import chokidar from 'chokidar';
 import { writeHeartbeat } from './indexer.ts';
 import { createIndexerService } from './indexer-service.ts';
+import { createAdaptiveWatcher } from '../../../packages/adaptive-watcher/src/index.ts';
 import { createWorkerBuildIndex } from './indexer-worker-client.ts';
 import { buildRecapExportQuery } from './recap-capture-query.ts';
 import { buildEditorUrl, DEFAULT_EDITOR_SCHEME, EDITOR_SCHEMES, resolveFileReference } from './file-reference.ts';
@@ -280,11 +280,12 @@ function startIndexerService({ buildOnStart = false } = {}) {
   migrateLegacyDbIfNeeded(paths);
   const service = createIndexerService({
     projectsDir: paths.projectsDir,
-    watchDirs: paths.providerRegistry.watchRoots(paths.providerRoots),
-    buildIndex: async ({ reason, changedPaths }) => {
+    watchTargets: paths.providerRegistry.watchTargets(paths.providerRoots),
+    buildIndex: async ({ reason, changedPaths, retrySessionIds }) => {
       const result = await indexerWorker.buildIndex({
         reason,
         changedPaths,
+        retrySessionIds,
         providerRoots: paths.providerRoots,
         providerSettings: paths.providerSettings,
         claudeDir: paths.claudeDir,
@@ -342,6 +343,8 @@ async function stopBackgroundResources({ stopWorker = false } = {}) {
   if (obeliskWatcher) {
     const watcher = obeliskWatcher;
     obeliskWatcher = null;
+    if (obeliskNotifyTimer) { clearTimeout(obeliskNotifyTimer); obeliskNotifyTimer = null; }
+    pendingObeliskChanges.clear();
     if (typeof watcher.close === 'function') await Promise.resolve(watcher.close());
   }
   closeDb();
@@ -429,25 +432,39 @@ function createWindow() {
 
 const OBELISK_DIR = path.join(os.homedir(), '.obelisk');
 const RECAP_DIR = path.join(OBELISK_DIR, 'recap');
-let obeliskWatcher: import("chokidar").FSWatcher | null = null;
+let obeliskWatcher: ReturnType<typeof createAdaptiveWatcher> | null = null;
+let obeliskNotifyTimer: ReturnType<typeof setTimeout> | null = null;
+const pendingObeliskChanges = new Set<string>();
+
+function flushObeliskChanges() {
+  obeliskNotifyTimer = null;
+  const changedPaths = [...pendingObeliskChanges];
+  pendingObeliskChanges.clear();
+  for (const changedPath of changedPaths) onObeliskChange(changedPath);
+}
 
 function startObeliskWatcher() {
   if (obeliskWatcher) return obeliskWatcher;
-  if (!fs.existsSync(OBELISK_DIR)) {
-    fs.mkdirSync(OBELISK_DIR, { recursive: true });
-  }
-  obeliskWatcher = chokidar.watch(OBELISK_DIR, {
-    ignoreInitial: true,
-    awaitWriteFinish: { stabilityThreshold: 300, pollInterval: 100 },
-    ignored: (p, stats) => {
-      if (stats?.isDirectory()) return false;
-      if (!stats) return false;
-      return !p.endsWith('.md') && !p.endsWith('.json');
+  // Idempotent ensure, off the main thread (mkdir recursive does not need an
+  // existence check). The watcher tolerates the directory appearing late —
+  // that is what the probe + retry loop inside the package is for — so there
+  // is no ordering dependency between the two.
+  void fs.promises.mkdir(OBELISK_DIR, { recursive: true }).catch(() => {});
+  obeliskWatcher = createAdaptiveWatcher({
+    targets: [{ kind: 'tree', path: OBELISK_DIR }],
+    onInvalidate: (invalidation) => {
+      if (invalidation.type !== 'paths') return;
+      for (const changedPath of invalidation.paths) {
+        if (!changedPath.endsWith('.md') && !changedPath.endsWith('.json')) continue;
+        // True trailing debounce — reset on every event so an actively written
+        // file notifies only after its writes settle (the awaitWriteFinish
+        // replacement). Without the reset this would be a throttle.
+        pendingObeliskChanges.add(changedPath);
+        if (obeliskNotifyTimer) clearTimeout(obeliskNotifyTimer);
+        obeliskNotifyTimer = setTimeout(flushObeliskChanges, 300);
+      }
     },
   });
-  obeliskWatcher.on('add', onObeliskChange);
-  obeliskWatcher.on('change', onObeliskChange);
-  obeliskWatcher.on('unlink', onObeliskChange);
   return obeliskWatcher;
 }
 
@@ -498,19 +515,23 @@ function querySessionMessages(sessionId: string): SessionMessageRow[] {
 function querySessionToolCalls(sessionId: string): SessionToolCallRow[] {
   if (!db) return [];
   return db.prepare(`
-    SELECT tc.* FROM tool_calls tc
-    JOIN messages m ON m.uuid = tc.message_uuid
-    WHERE tc.session_id = ? AND COALESCE(m.visibility, 'visible') = 'visible'
-  `).all(sessionId) as SessionToolCallRow[];
+    SELECT tc.* FROM messages m
+    CROSS JOIN tool_calls tc ON tc.message_uuid = m.uuid
+    WHERE m.session_id = ? AND m.agent_id IS NULL
+      AND COALESCE(m.visibility, 'visible') = 'visible'
+      AND tc.session_id = ?
+  `).all(sessionId, sessionId) as SessionToolCallRow[];
 }
 
 function querySessionToolResults(sessionId: string): SessionToolResultRow[] {
   if (!db) return [];
   return db.prepare(`
-    SELECT tr.* FROM tool_results tr
-    JOIN messages m ON m.uuid = tr.message_uuid
-    WHERE tr.session_id = ? AND COALESCE(m.visibility, 'visible') = 'visible'
-  `).all(sessionId) as SessionToolResultRow[];
+    SELECT tr.* FROM messages m
+    CROSS JOIN tool_results tr ON tr.message_uuid = m.uuid
+    WHERE m.session_id = ? AND m.agent_id IS NULL
+      AND COALESCE(m.visibility, 'visible') = 'visible'
+      AND tr.session_id = ?
+  `).all(sessionId, sessionId) as SessionToolResultRow[];
 }
 
 function querySessionSubagents(sessionId: string): SessionSubagentRow[] {
@@ -775,60 +796,49 @@ ipcMain.handle('db:getStats', (_, opts = {}) => {
 
 ipcMain.handle('db:getUsageStats', (_, opts = {}) => {
   if (!db) return { daily: [], totalTokens: 0, peakDay: null, longestTurn: null };
-  const sourceFilter = sourceWhereClause(opts, 'source');
-  const sourceSql = sourceFilter.sql ? `AND ${sourceFilter.sql}` : '';
-  const usageEvents = `
-    WITH usage_events AS (
-      SELECT timestamp, input_tokens, output_tokens, COALESCE(source, 'claude') AS source
-      FROM messages
-      UNION ALL
-      SELECT su.timestamp, su.input_tokens, su.output_tokens,
-             COALESCE(s.source, 'claude') AS source
-      FROM summaries su
-      LEFT JOIN sessions s ON s.id = su.session_id
-    )
-  `;
   // Visibility controls evidence display, not accounting. Abandoned model calls
   // still consumed tokens, so aggregate usage intentionally includes them.
-
-  const daily = db.prepare(`
-    ${usageEvents}
+  const messageSourceFilter = sourceWhereClause(opts, 'source');
+  const summarySourceFilter = sourceWhereClause(opts, 's.source');
+  const usageDays = db.prepare(`
+    WITH usage_events AS (
+      SELECT timestamp, input_tokens, output_tokens
+      FROM messages
+      WHERE (input_tokens IS NOT NULL OR output_tokens IS NOT NULL)
+        ${messageSourceFilter.sql ? `AND ${messageSourceFilter.sql}` : ''}
+      UNION ALL
+      SELECT su.timestamp, su.input_tokens, su.output_tokens
+      FROM summaries su
+      LEFT JOIN sessions s ON s.id = su.session_id
+      WHERE (su.input_tokens IS NOT NULL OR su.output_tokens IS NOT NULL)
+        ${summarySourceFilter.sql ? `AND ${summarySourceFilter.sql}` : ''}
+    )
     SELECT DATE(timestamp) as day,
            SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0)) as tokens
     FROM usage_events
-    WHERE timestamp IS NOT NULL AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL)
-      ${sourceSql}
     GROUP BY DATE(timestamp)
     ORDER BY day
-  `).all(...sourceFilter.params);
+  `).all(...messageSourceFilter.params, ...summarySourceFilter.params);
 
-  const totalTokens = db.prepare(`
-    ${usageEvents}
-    SELECT SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0)) as total
-    FROM usage_events
-    ${sourceFilter.sql ? `WHERE ${sourceFilter.sql}` : ''}
-  `).get(...sourceFilter.params)?.total || 0;
+  const totalTokens = usageDays.reduce((total, row) => total + (row.tokens || 0), 0);
+  const daily: Array<{ day: string; tokens: number }> = [];
+  for (const row of usageDays) {
+    if (row.day !== null) daily.push({ day: row.day, tokens: row.tokens || 0 });
+  }
 
-  const peakDay = db.prepare(`
-    ${usageEvents}
-    SELECT DATE(timestamp) as day,
-           SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0)) as tokens
-    FROM usage_events
-    WHERE timestamp IS NOT NULL AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL)
-      ${sourceSql}
-    GROUP BY DATE(timestamp)
-    ORDER BY tokens DESC
-    LIMIT 1
-  `).get(...sourceFilter.params) || null;
+  let peakDay: { day: string; tokens: number } | null = null;
+  for (const day of daily) {
+    if (!peakDay || day.tokens > peakDay.tokens) peakDay = day;
+  }
 
   const longestTurn = db.prepare(`
     SELECT turn_duration_ms, uuid, session_id, timestamp
     FROM messages
     WHERE turn_duration_ms IS NOT NULL
-      ${sourceSql}
+      ${messageSourceFilter.sql ? `AND ${messageSourceFilter.sql}` : ''}
     ORDER BY turn_duration_ms DESC
     LIMIT 1
-  `).get(...sourceFilter.params) || null;
+  `).get(...messageSourceFilter.params) || null;
 
   return { daily, totalTokens, peakDay, longestTurn };
 });
@@ -1061,6 +1071,7 @@ ipcMain.handle('settings:rebuildIndex', async () => {
   }
   cleanupDbFiles(tempDbPath);
   let writerLease: ReturnType<typeof acquireWriterLease> = null;
+  let rebuildWatchHints: string[] = [];
   try {
     const writerLeasePath = writerLockPathFor(paths.dbPath);
     writerLease = acquireWriterLease({
@@ -1097,6 +1108,7 @@ ipcMain.handle('settings:rebuildIndex', async () => {
       writerLeasePath,
       writerLeaseMode: 'caller-held',
     });
+    rebuildWatchHints = result?.watchHints ?? [];
     if (result?.deferred || result?.complete !== true) {
       notifyIndexUpdated(result);
       return result;
@@ -1121,7 +1133,18 @@ ipcMain.handle('settings:rebuildIndex', async () => {
     } finally {
       writerLease?.release();
       if (loadPersistedSettings().autoRefresh !== false) {
-        startIndexerService({ buildOnStart: false });
+        const service = startIndexerService({ buildOnStart: false });
+        if (rebuildWatchHints.length) {
+          // The rebuild bypassed the service's own build path, so seed the
+          // hot set from its hints here.
+          service?.promoteWatchHints?.(rebuildWatchHints);
+        } else {
+          // A failed/deferred rebuild produced no hints and the old hot set
+          // died with the old watcher. Run one reconciling build through the
+          // service — its deferral retry absorbs writer-busy — so long-open
+          // transcripts are re-seeded now, not at the next 5-min reconcile.
+          service?.runBuildNow('reconcile');
+        }
       }
     }
   }

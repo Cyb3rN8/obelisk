@@ -38,7 +38,7 @@ import type {
 } from './types.ts';
 
 export const name = 'codex';
-const CODEX_CANONICAL_TRANSCRIPT_MARKER = '__codex_canonical_transcript_v2__';
+const CODEX_CANONICAL_TRANSCRIPT_MARKER = '__codex_canonical_transcript_v3__';
 const CODEX_SESSIONS_DIR = 'sessions';
 const CODEX_ARCHIVED_SESSIONS_DIR = 'archived_sessions';
 
@@ -55,6 +55,23 @@ function codexTranscriptDirs(rootDir: string): string[] {
     join(rootDir, CODEX_SESSIONS_DIR),
     join(rootDir, CODEX_ARCHIVED_SESSIONS_DIR),
   ];
+}
+
+// Cursor format: `${mtime}:${lines}:${size}:${ctimeMs}:${ino}`. The
+// mtime+ctime+size+inode signature (CONTRIBUTING: cursors must detect
+// same-millisecond rewrites) lets a same-mtime tail completion or a
+// same-mtime replacement back into discovery. Unlike claude's legacy gate
+// (#102), two-part cursors here fail closed: codex never shipped a five-part
+// cursor before v3, so every legacy cursor can only prove "mtime not older",
+// never "unchanged" — it re-parses once and upgrades to the full signature.
+function codexCursorSignatureDiffers(cursor: string, filePath: string): boolean {
+  const stat = statSync(filePath);
+  const parts = cursor.split(':');
+  if (parts.length < 5) return true;
+  return Number(parts[0]) !== stat.mtimeMs
+    || Number(parts[2]) !== stat.size
+    || Number(parts[3]) !== stat.ctimeMs
+    || Number(parts[4]) !== stat.ino;
 }
 
 function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
@@ -98,10 +115,15 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
       const fileChanged = changedFiles.has(normalize(file.path));
       if (ctx.changedPaths !== undefined && !sessionIndexChanged && !fileChanged) return [];
       const cursor = ctx.lastCursor(file.path);
-      const guardian = readCodexGuardianThreadInfo(file.path);
-      if (!sessionIndexChanged && !fileChanged && cursor !== null && Number(cursor.split(':')[0]) >= statSync(file.path).mtimeMs && guardian === null) {
+      // Skip unchanged files before paying for guardian detection: guardian
+      // status is content-derived, so a file whose cursor signature still
+      // matches cannot have changed status. Pre-v3 databases may still hold
+      // guardian session rows; the v3 marker bump forces one full replay that
+      // retracts them.
+      if (!sessionIndexChanged && !fileChanged && cursor !== null && !codexCursorSignatureDiffers(cursor, file.path)) {
         return [];
       }
+      const guardian = readCodexGuardianThreadInfo(file.path);
       let meta: any = null;
       readLines(file.path, (line: string) => {
         try {
@@ -134,14 +156,14 @@ export function discover(ctx: DiscoverContext): IndexUnit[] {
 }
 
 export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRecord, Cursor> {
-  const mtime = statSync(unit.key).mtimeMs;
+  const stat = statSync(unit.key);
   const records: { lineNum: number; obj: any }[] = [];
   let lineNum = 0;
   readLines(unit.key, (line: string) => {
     lineNum++;
     try { records.push({ lineNum, obj: JSON.parse(line) }); } catch { /* skip malformed */ }
   });
-  const outCursor = `${mtime}:${lineNum}`;
+  const outCursor = `${stat.mtimeMs}:${lineNum}:${stat.size}:${stat.ctimeMs}:${stat.ino}`;
 
   const metaRecord = records.find(r => r.obj?.type === 'session_meta' && r.obj.payload?.id);
   if (!metaRecord) return outCursor;
@@ -386,9 +408,9 @@ export function createCodexProvider({ rootDir = join(homedir(), '.codex') }: { r
     name,
     descriptor: { id: name, name: 'Codex', vendor: 'OpenAI', defaultRoot: rootDir, color: '#10a37f' },
     indexVersionMarker: CODEX_CANONICAL_TRANSCRIPT_MARKER,
-    watchRoots: (configuredRoot) => [
-      ...codexTranscriptDirs(configuredRoot),
-      join(configuredRoot, 'session_index.jsonl'),
+    watchTargets: (configuredRoot) => [
+      ...codexTranscriptDirs(configuredRoot).map((dir) => ({ kind: 'tree' as const, path: dir })),
+      { kind: 'file', path: join(configuredRoot, 'session_index.jsonl') },
     ],
     discover: (ctx) => discoverAt(rootDir, ctx),
     parse,

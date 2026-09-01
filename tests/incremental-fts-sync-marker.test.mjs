@@ -4,7 +4,7 @@
 // The wholesale messages_fts rebuild no longer runs in every incremental
 // finalize: the schema triggers (ai/au/ad) plus persist's upsert keep the index
 // consistent row-by-row, and the one-time heal is recorded under the
-// __messages_fts_synced__ marker in index_state.
+// __fts_triggers_ready__ marker in index_state (ensureFtsReady, index-finalize.ts).
 //
 // The "did the rebuild run?" probe is a poison posting: a row inserted straight
 // into messages_fts with no counterpart in messages. A wholesale rebuild
@@ -27,7 +27,7 @@ const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite');
 
 const SCHEMA = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
-const SYNC_MARKER = '__messages_fts_synced__';
+const SYNC_MARKER = '__fts_triggers_ready__';
 
 function line(uuid, type, ts, text = `${type} ${uuid}`) {
   return JSON.stringify({ uuid, type, timestamp: ts, cwd: '/tmp/proj', message: { role: type, content: text } });

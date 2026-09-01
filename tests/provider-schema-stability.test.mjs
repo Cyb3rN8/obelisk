@@ -12,10 +12,10 @@ test('canonical transcript persistence schema changes only by explicit decision'
   const schema = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url));
   assert.equal(
     createHash('sha256').update(schema).digest('hex'),
-    // 2026-08-12: added the copyright/SPDX header comment; no schema change.
+    // 2026-08-24: indexed Activity queries and the visible main session timeline.
     // LOCAL: this branch also carries tool_errors_fts, so the pin diverges from
-    // upstream's 4c686782... by exactly that table.
-    '04313356f03832768eec51edfcea617243f9cd1611b1b39839cf429fb2bd5c44',
+    // upstream's 0417d1a0... by exactly that table.
+    'f691b8e3dc40a65577a7fabc0a1bf169b0263edcfee651f93c42ecf1c3874656',
   );
 });
 

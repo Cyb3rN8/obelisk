@@ -3,13 +3,19 @@
 
 // Passive-pull indexing orchestration for the Core package.
 import { existsSync } from 'node:fs';
-import { DB_PATH, openDb, openReadDb, openWriterLeaseDb, rebuildMemoryFts, rebuildToolErrorsFts } from './db.ts';
+import { DB_PATH, openDb, openReadDb, openWriterLeaseDb, rebuildToolErrorsFts } from './db.ts';
+import {
+  backfillUnresolvedSessionProjectPathsOnce,
+  ensureFtsReady,
+  refreshSessionProjectPaths,
+} from './index-finalize.ts';
 import { inferProjectPath } from './parsing.ts';
 import {
   createProviderIndexPlan,
   indexProviderPlan,
   indexProviderPlanStrict,
   ProviderIndexFailure,
+  readRecentTranscriptHints,
   writeProviderIndexMarkers,
 } from './provider-indexing.ts';
 import { ftsTokenizerMigrationPending, resolveFtsTokenizer } from './schema-migrations.ts';
@@ -22,7 +28,7 @@ import {
 } from './provider-settings.ts';
 import { coreSchemaNeedsMigration } from './schema-migrations.ts';
 import type { ProviderRegistry } from './providers/registry.ts';
-import type { NodeSqliteDb, SqliteDb, SqliteRow } from './sqlite-types.ts';
+import type { NodeSqliteDb, SqliteDb } from './sqlite-types.ts';
 
 interface SkippedFile {
   provider: string;
@@ -61,22 +67,6 @@ function errorMessage(error: unknown): string {
 }
 
 
-function refreshSessionProjectPaths(db: NodeSqliteDb): void {
-  const sessions = db.prepare('SELECT id, project FROM sessions').all();
-  const cwdStmt = db.prepare(`
-    SELECT cwd
-    FROM messages
-    WHERE session_id = ? AND cwd IS NOT NULL AND cwd != ''
-    ORDER BY timestamp IS NULL, timestamp
-  `);
-  const update = db.prepare('UPDATE sessions SET project_path = ? WHERE id = ?');
-  for (const session of sessions) {
-    const cwds = cwdStmt.all(session.id).map((row: SqliteRow) => row.cwd);
-    const projectPath = inferProjectPath(session.project, cwds);
-    if (projectPath) update.run(projectPath, session.id);
-  }
-}
-
 // A workflow unit links to its parent Workflow tool call by matching the unique
 // run id in the tool_result text — but the run json can reach the index before
 // that tool_result lands in the main transcript, leaving parent_tool_use_id
@@ -113,34 +103,8 @@ function healWorkflowParentLinks(db: SqliteDb): void {
 const BUILD_DEBOUNCE_MS = 30000;
 const APP_HEARTBEAT_FRESH_MS = 60000;
 
-// messages_fts is maintained row-by-row by its schema triggers: persist writes
-// messages with INSERT ... ON CONFLICT DO UPDATE (fires messages_fts_au) and
-// deletes them with plain DELETE (fires messages_fts_ad), so an incremental
-// build never leaves the index stale. The wholesale rebuild that used to run in
-// every finalize predates that guarantee, and its cost is independent of how
-// much changed — on a 1.8 GB index it is ~30 s of a ~50 s incremental build
-// (3× that under a trigram tokenizer). It is still needed exactly once, to heal
-// an index whose rows were written before trigger-only maintenance could be
-// trusted (e.g. by a version that wrote messages with INSERT OR REPLACE, whose
-// implicit deletes fire no DELETE trigger). This marker records that the heal
-// has happened; it is written in the same transaction as the rebuild, so an
-// interrupted build simply redoes it — the marker never runs ahead of the work.
-const MESSAGES_FTS_SYNC_MARKER = '__messages_fts_synced__';
-
-function markMessagesFtsSynced(db: SqliteDb): void {
-  db.prepare(
-    "INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES (?, ?, 0)",
-  ).run(MESSAGES_FTS_SYNC_MARKER, Date.now());
-}
-
-function syncMessagesFtsOnce(db: SqliteDb): void {
-  const done = db.prepare('SELECT jsonl_path FROM index_state WHERE jsonl_path = ?').get(MESSAGES_FTS_SYNC_MARKER);
-  if (done) return;
-  db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
-  markMessagesFtsSynced(db);
-}
-
-// LOCAL: same one-time-heal pattern for tool_errors_fts. persist upserts
+// LOCAL: same one-time-heal pattern ensureFtsReady() applies to messages_fts and
+// memories_fts, for the fork-only tool_errors_fts. persist upserts
 // tool_results (stable rowid, AU trigger fires), so the schema triggers keep
 // the table truthful; the wholesale rowid-aligned refresh runs once to heal
 // rows written before trigger maintenance. Not written by the force path —
@@ -288,14 +252,10 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
               db,
               plan: providerPlan,
             });
-            refreshSessionProjectPaths(db);
+            refreshSessionProjectPaths(db, null);
+            backfillUnresolvedSessionProjectPathsOnce(db);
             healWorkflowParentLinks(db);
-            // A force snapshot keeps the wholesale rebuild as its last line of
-            // defence, and re-records the sync marker it just wiped with
-            // index_state so the next incremental build trusts the triggers.
-            db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
-            markMessagesFtsSynced(db);
-            rebuildMemoryFts(db);
+            ensureFtsReady(db, { force: true });
             db.prepare("INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES ('__last_build__', ?, 0)").run(Date.now());
             writeProviderIndexMarkers(db, providerPlan, providerResult);
           }, { label: 'force-rebuild' });
@@ -341,6 +301,7 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
           inventoryIssues,
           skipped: 0,
           skippedFiles,
+          watchHints: readRecentTranscriptHints(db),
         };
       }
 
@@ -348,6 +309,12 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
         db,
         plan: providerPlan,
         runTransaction: (label, work) => runRetryableWriteTransaction(txDb, work, { label }),
+        onPersisted: ({ unit }) => {
+          refreshSessionProjectPaths(db, new Set([
+            unit.sessionId,
+            ...(unit.retractSessionIds ?? []),
+          ]));
+        },
         onError: (error, { provider, unit }) => {
           if (isBeginBusyFailure(error)) return 'stop';
           if (hasUnusableTransaction(error)) throw error;
@@ -378,10 +345,11 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
       // the build (a half-finalized index would be inconsistent).
       try {
         runRetryableWriteTransaction(txDb, () => {
-          refreshSessionProjectPaths(db);
+          // Per-unit paths commit atomically with their provider cursors above;
+          // legacy unresolved rows use one explicit, convergent backfill.
+          backfillUnresolvedSessionProjectPathsOnce(db);
           healWorkflowParentLinks(db);
-          syncMessagesFtsOnce(db);
-          rebuildMemoryFts(db);
+          ensureFtsReady(db);
           syncToolErrorsFtsOnce(db);
           db.prepare("INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES ('__last_build__', ?, 0)").run(Date.now());
           writeProviderIndexMarkers(db, providerPlan, providerResult);
@@ -407,6 +375,7 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
         inventoryIssues,
         skipped: skippedFiles.length,
         skippedFiles,
+        watchHints: readRecentTranscriptHints(db),
       };
     } finally {
       db.close();

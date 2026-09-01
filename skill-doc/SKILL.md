@@ -29,6 +29,25 @@ Obelisk is a CodeAct memory layer: write a small JS query, run it locally, read
 the JSON, then answer. Do not turn history into a flat document or browse entire
 sessions by default.
 
+## Fresh Index and Sandbox Permissions
+
+Treat a successful Obelisk invocation as a precondition for using its results.
+Obelisk refreshes `~/.obelisk/obelisk.sqlite` before retrieval so the answer
+includes the latest sessions and can identify the invoking session. Never
+degrade to a stale, read-only index when that refresh cannot write.
+
+In Codex `workspace-write` or managed sandboxes, `~/.obelisk` may be outside the
+writable roots. If an Obelisk command fails with `SQLITE_READONLY`, `EACCES`,
+`EPERM`, `attempt to write a readonly database`, or another permission error for
+`~/.obelisk`, rerun the same command with
+`sandbox_permissions: "require_escalated"`. On another agent host, use its
+equivalent mechanism to grant write access to `~/.obelisk`. Do not replace the
+failed command with direct SQLite, JSONL, or stale-index reads.
+
+If write access is unavailable or the user denies escalation, stop and report
+the permission blocker. Retrieval is complete only when the Obelisk command
+exits successfully and returns its query result.
+
 ## Execution Mode
 
 LOCAL: this section is a local convention for harnesses that can delegate to
@@ -114,16 +133,18 @@ catch retrieval errors.
 ## Quick Start
 
 Fast keyword search (pass a unique nonce so Obelisk can recognize your own
-session in results):
+session in results). Invent the nonce yourself and type it as a literal token:
+the transcript records the command as typed, so a shell substitution like
+`$(uuidgen)` never expands there and can never resolve:
 
 ```bash
-obelisk --search "keyword" --nonce "$(uuidgen 2>/dev/null || echo "$$.$RANDOM.$RANDOM")"
+obelisk --search "keyword" --nonce "obq-<unique-token-you-invent>"
 ```
 
 Custom query:
 
-1. Write a bounded JS query to a unique temp file — the as-typed file path is
-   your invocation nonce:
+1. Write a bounded JS query to a unique temp file (a Write tool call or a
+   heredoc both work):
 
    ```bash
    qdir=$(mktemp -d /tmp/obq.XXXXXX 2>/dev/null || { d="/tmp/obq.$$.$RANDOM"; mkdir "$d"; echo "$d"; })
@@ -139,6 +160,10 @@ Custom query:
    obelisk --query "$qfile"
    ```
 
+   Self-identification matches the file path when the transcript contains it,
+   and falls back to the script content — heredoc/Write tool-call records
+   carry it verbatim, so a path hidden behind `$qfile` still resolves.
+
 3. Parse JSON stdout and answer with concise evidence.
 
 The query file runs inside `(async () => { ... })()`. Use `return` to emit JSON.
@@ -148,10 +173,11 @@ Query scripts are read-only: `remember()` and `forget()` are not available, and
 ## Your Own Session In Results
 
 Obelisk refreshes the index before each query, so your own live session shows
-up in results. The invocation nonce (`--search --nonce`, or the unique
-`--query` file path) lets Obelisk mark it: session projections in `search()`
-hits and `sessions()` rows carry `is_invoking: true`, and
-`overview().current.session_id` holds the invoking session id when known. Treat
+up in results. The invocation nonce (a literal `--search --nonce` token, or the
+`--query` file path with script content as fallback) lets Obelisk mark it:
+session projections in `search()` hits and `sessions()` rows carry
+`is_invoking: true`, and `overview().current.session_id` holds the invoking
+session id when known. Treat
 a session flagged `is_invoking` as your own current context, NOT as independent
 historical evidence. Resolution is newest-wins over recent matches; only a
 near-simultaneous same-nonce collision (or no match at all) leaves nothing
@@ -328,7 +354,7 @@ identity. Results are already ordered by FTS5 rank; lower rank sorts earlier.
 Prefer returned order over manually interpreting numeric rank unless you are
 deliberately using FTS5 semantics.
 
-`source` can be `'claude'`, `'codex'`, `'kimi'`, `'pi'`, or omitted. Omitted
+`source` can be `'claude'`, `'codex'`, `'deepseek'`, `'kimi'`, `'pi'`, or omitted. Omitted
 means search all indexed sources.
 
 ### `context(uuid, opts?)`
