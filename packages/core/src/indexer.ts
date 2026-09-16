@@ -7,6 +7,7 @@ import { DB_PATH, openDb, openReadDb, openWriterLeaseDb, rebuildToolErrorsFts } 
 import {
   backfillUnresolvedSessionProjectPathsOnce,
   ensureFtsReady,
+  refreshHandoffEdges,
   refreshSessionProjectPaths,
 } from './index-finalize.ts';
 import { inferProjectPath } from './parsing.ts';
@@ -255,6 +256,7 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
             refreshSessionProjectPaths(db, null);
             backfillUnresolvedSessionProjectPathsOnce(db);
             healWorkflowParentLinks(db);
+            refreshHandoffEdges(db);
             ensureFtsReady(db, { force: true });
             db.prepare("INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES ('__last_build__', ?, 0)").run(Date.now());
             writeProviderIndexMarkers(db, providerPlan, providerResult);
@@ -349,6 +351,7 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
           // legacy unresolved rows use one explicit, convergent backfill.
           backfillUnresolvedSessionProjectPathsOnce(db);
           healWorkflowParentLinks(db);
+          refreshHandoffEdges(db);
           ensureFtsReady(db);
           syncToolErrorsFtsOnce(db);
           db.prepare("INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES ('__last_build__', ?, 0)").run(Date.now());

@@ -10,6 +10,7 @@ import { createBuiltinProviderRegistry } from '../../../packages/core/src/provid
 import {
   dropMessageFtsTriggers,
   ensureFtsReady,
+  refreshHandoffEdges,
   refreshSessionProjectPaths,
 } from '../../../packages/core/src/index-finalize.ts';
 import { healWorkflowParentLinks } from '../../../packages/core/src/indexer.ts';
@@ -391,6 +392,7 @@ function buildIndex({
           : null;
         refreshSessionProjectPaths(db, projectPathSessionIds);
         healWorkflowParentLinks(db);
+        refreshHandoffEdges(db);
         if (messageFtsTriggersDropped) installSchema(db, schemaPath);
         ftsRebuilt = ensureFtsReady(db, { force });
         writeIndexMarker(db, '__last_build__');

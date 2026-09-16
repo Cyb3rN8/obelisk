@@ -12,6 +12,7 @@ import {
   PROJECT_PATH_BACKFILL_MARKER,
   backfillUnresolvedSessionProjectPathsOnce,
   ensureFtsReady,
+  refreshHandoffEdges,
   refreshSessionProjectPaths,
 } from '../packages/core/src/index-finalize.ts';
 import { persist } from '../packages/core/src/persist.ts';
@@ -199,4 +200,28 @@ test('ordinary Core build skips corpus-wide FTS and project-path work', () => {
     'an unchanged session is not included in ordinary project-path refresh',
   );
   db.close();
+});
+
+test('refreshHandoffEdges derives producer->consumer handoff edges and is convergent', () => {
+  const db = freshDb();
+  const msg = db.prepare(
+    "INSERT INTO messages (uuid, session_id, type, timestamp, role, source) VALUES (?, ?, 'assistant', ?, 'assistant', 'claude')",
+  );
+  const tc = db.prepare(
+    "INSERT INTO tool_calls (id, message_uuid, session_id, name, input_json, file_path) VALUES (?, ?, ?, ?, '{}', ?)",
+  );
+  const H = '/repo/handoffs/2026-09-01-x.md';
+  msg.run('mA', 'A', '2026-09-01T00:00:00Z'); tc.run('t1', 'mA', 'A', 'Write', H);
+  msg.run('mA2', 'A', '2026-09-01T00:10:00Z'); tc.run('t2', 'mA2', 'A', 'Read', H); // self-read: no edge
+  msg.run('mB', 'B', '2026-09-01T01:00:00Z'); tc.run('t3', 'mB', 'B', 'Read', H); // edge A->B
+  msg.run('mB2', 'B', '2026-09-01T01:30:00Z'); tc.run('t4', 'mB2', 'B', 'Read', H); // dup read: same edge
+  msg.run('mC', 'C', '2026-09-01T02:00:00Z');
+  tc.run('t5', 'mC', 'C', 'Read', '/x/research/2026-08-18-handoff-ctx/raw/handoff.md'); // fixture carve-out
+  msg.run('mD', 'D', '2026-09-01T03:00:00Z'); tc.run('t6', 'mD', 'D', 'Read', '/repo/notes.md'); // not a handoff
+  refreshHandoffEdges(db);
+  refreshHandoffEdges(db); // full rebuild each finalize: second run must converge to same rows
+  assert.deepEqual(
+    db.prepare('SELECT src_session_id, dst_session_id, kind, evidence, observed_at FROM session_edges ORDER BY dst_session_id').all().map(r => ({ ...r })), // node:sqlite rows are null-prototype
+    [{ src_session_id: 'A', dst_session_id: 'B', kind: 'handoff_file', evidence: H, observed_at: '2026-09-01T01:00:00Z' }],
+  );
 });

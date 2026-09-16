@@ -111,6 +111,11 @@ CREATE INDEX IF NOT EXISTS idx_sa_session ON subagents(session_id);
 CREATE INDEX IF NOT EXISTS idx_wf_session ON workflows(session_id);
 CREATE INDEX IF NOT EXISTS idx_wa_run ON workflow_agents(run_id);
 CREATE INDEX IF NOT EXISTS idx_summaries_session ON summaries(session_id);
+CREATE TABLE IF NOT EXISTS session_edges (
+  src_session_id TEXT, dst_session_id TEXT, kind TEXT,
+  evidence TEXT, observed_at TEXT,
+  PRIMARY KEY (src_session_id, dst_session_id, kind));
+CREATE INDEX IF NOT EXISTS idx_se_dst ON session_edges(dst_session_id);
 CREATE TABLE IF NOT EXISTS memories (
   id TEXT PRIMARY KEY, session_id TEXT, project TEXT,
   message_start TEXT, message_end TEXT,
