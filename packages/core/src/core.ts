@@ -385,7 +385,20 @@ export function resolveInvokingSessionIdWithWait(
     const hit = tryResolve();
     if (hit) return hit;
   }
+  // LOCAL（不上游）：poll 模式下耗尽 cap 意味着"我们把索引让给了 daemon，而它在
+  // 预算内没追上"。此前这件事对调用方完全不可见——只看到这次查询慢了四秒，既不知道
+  // 那四秒在等什么，也不知道等失败了，于是分不清"历史里没有"与"还没索引到"。
+  // 只在 poll 门控下说：未设该 env 时走的是上游自建路径，耗尽 cap 的含义不同，
+  // 保持上游的静默行为。
+  if (process.env.OBELISK_NONCE_RECOVERY === 'poll') reportInvocationWaitExhausted(pollCapMs);
   return null;
+}
+
+// stdout carries the query result, so the notice goes to stderr.
+function reportInvocationWaitExhausted(capMs: number): void {
+  process.stderr.write(
+    `obelisk: index did not catch up within ${capMs}ms; the newest turns of this session may be missing from these results — re-run the query to pick them up\n`,
+  );
 }
 
 // FTS search over indexed message text. Refreshes the index, then queries.

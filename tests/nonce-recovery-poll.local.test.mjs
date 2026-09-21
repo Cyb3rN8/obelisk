@@ -60,6 +60,9 @@ test('OBELISK_NONCE_RECOVERY=poll: fresh heartbeat suppresses the in-process rec
   assert.equal(result.status, 0, result.stderr || result.stdout);
   // 未 build，新 transcript 不可见：证明 recovery 没有在查询进程内自建。
   assert.deepEqual(JSON.parse(result.stdout), []);
+  // 等待用尽 cap 后必须说出来：否则调用方分不清「历史里没有」与「还没索引到」。
+  assert.match(result.stderr, /index did not catch up within 4000ms/);
+  assert.doesNotMatch(result.stdout, /did not catch up/, '提示走 stderr，不得污染 JSON 结果');
 });
 
 test('OBELISK_NONCE_RECOVERY=poll: stale heartbeat falls back to the upstream carve-out build', () => {
@@ -79,4 +82,6 @@ test('OBELISK_NONCE_RECOVERY=poll: stale heartbeat falls back to the upstream ca
   assert.equal(hits.length, 1);
   assert.equal(hits[0].session.id, 'poll-invoking-session');
   assert.equal(hits[0].session.is_invoking, true);
+  // nonce 解析成功即没有等待失败，不该有噪声。
+  assert.doesNotMatch(result.stderr, /did not catch up/);
 });

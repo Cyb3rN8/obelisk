@@ -49,6 +49,24 @@ If write access is unavailable or the user denies escalation, stop and report
 the permission blocker. Retrieval is complete only when the Obelisk command
 exits successfully and returns its query result.
 
+LOCAL: this install runs a headless indexing daemon, so the CLI does not build
+the index itself while that daemon is fresh — it waits for the daemon's build,
+up to a 4s cap, then queries the last committed index regardless. Two things
+follow, and neither is a fault to fix:
+
+- **A call that takes about four seconds is the daemon building, not a hang.**
+  It happens exactly while agents are writing transcripts, which is when
+  retrieval is most often called. Wait it out. At rest the same query is under
+  0.15s.
+- **`writer_busy` means another session holds the writer.** Retry; the index is
+  self-healing and the next successful invocation catches up.
+
+Never kill the daemon and never reach for `--rebuild` to "fix" staleness:
+`--build` is incremental and any successful invocation already refreshes. A
+rebuild drops and re-reads the whole index, costs minutes, and does not make a
+result fresher than the wait above already does. If a result looks like it is
+missing something that just happened, run the same query once more.
+
 ## Execution Mode
 
 LOCAL: this section is a local convention for harnesses that can delegate to
@@ -203,6 +221,13 @@ const self = 'current session_id';  // the session you are running in
 // mixed with longer terms they are enforced as literal substrings
 // (degraded: 'short-token-post-filter'), and an all-short query LIKE-scans
 // the content table (degraded: 'like-scan', rank null, recency-ordered).
+// The guard does NOT reach two raw-FTS5 shapes: with OR/NOT/NEAR present, and
+// with no term long enough to MATCH, the short terms constrain nothing and the
+// hits say degraded: 'short-token-unguarded' — rewrite as plain terms to get
+// the guard back. An EMPTY result carries no degraded marker at all (it rides
+// on hits), so an empty answer to a query holding a <3-char term may be a
+// dropped term, not an absent one: retry it as plain terms before reporting
+// "not found". sql() with a hand-written MATCH is never guarded.
 // Prefer >=3-char phrases anyway — degraded paths cost more and the all-short
 // one loses FTS ranking. Hits carry a hit-centered `snippet`; quote it instead
 // of slicing text from the head (long messages match far past the front).
