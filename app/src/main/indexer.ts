@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 import { createBuiltinProviderRegistry } from '../../../packages/core/src/providers/builtins.ts';
 import {
+  backfillUnresolvedSessionProjectPathsOnce,
   dropMessageFtsTriggers,
   ensureFtsReady,
   refreshHandoffEdges,
@@ -205,6 +206,8 @@ interface BuildIndexOptions {
   DatabaseImpl?: new (dbPath: string) => any;
   LockDatabaseImpl?: new (dbPath: string) => any;
   force?: boolean;
+  reason?: string;
+  readMode?: 'normal' | 'strict';
   changedPaths?: string[];
   retrySessionIds?: string[];
   preserveDbPath?: string | null;
@@ -268,6 +271,8 @@ function buildIndex({
   DatabaseImpl = Database,
   LockDatabaseImpl = DatabaseImpl,
   force = false,
+  reason = undefined,
+  readMode = reason === 'reconcile' || reason === 'repair' ? 'strict' : 'normal',
   changedPaths = undefined,
   retrySessionIds = [],
   preserveDbPath = null,
@@ -319,14 +324,21 @@ function buildIndex({
         codex: codexDir,
         ...providerRoots,
       };
+      const openCopilotChronicle = (sourcePath: string) => new (
+        DatabaseImpl as new (path: string, options?: { readonly?: boolean; fileMustExist?: boolean }) => any
+      )(sourcePath, { readonly: true, fileMustExist: true });
       const registry = providerRegistry
         ?? (providerSettings === undefined
-          ? createBuiltinProviderRegistry(roots)
-          : createConfiguredBuiltinProviderRuntime(providerSettings, { baseRoots: roots }).registry);
+          ? createBuiltinProviderRegistry(roots, { openCopilotChronicle })
+          : createConfiguredBuiltinProviderRuntime(providerSettings, {
+            baseRoots: roots,
+            openCopilotChronicle,
+          }).registry);
       const providerPlan = createProviderIndexPlan(db, registry, {
         force,
         changedPaths,
         priorSessions,
+        readMode,
       });
       let latestSourceMtime = providerPlan.items.reduce((latest, { unit }) => {
         const providerCursor = (unit.meta as { currentCursor?: unknown } | undefined)?.currentCursor;
@@ -387,10 +399,15 @@ function buildIndex({
         for (const sessionId of unit.retractSessionIds ?? []) affectedSessionIds.add(sessionId);
       };
       const finalize = (providerResult) => {
-        const projectPathSessionIds = !force && Array.isArray(changedPaths)
-          ? new Set([...retrySessionIds, ...affectedSessionIds, ...finalizeAffectedSessionIds])
-          : null;
-        refreshSessionProjectPaths(db, projectPathSessionIds);
+        if (force) {
+          refreshSessionProjectPaths(db, null);
+        } else {
+          refreshSessionProjectPaths(
+            db,
+            new Set([...retrySessionIds, ...affectedSessionIds, ...finalizeAffectedSessionIds]),
+          );
+          backfillUnresolvedSessionProjectPathsOnce(db);
+        }
         healWorkflowParentLinks(db);
         refreshHandoffEdges(db);
         if (messageFtsTriggersDropped) installSchema(db, schemaPath);
