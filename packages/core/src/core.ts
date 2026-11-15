@@ -27,6 +27,7 @@ import type { SqliteDb } from './sqlite-types.ts';
 import { nodeSqliteTransactionAdapter } from './tx.ts';
 import { runRetryableWriteTransaction } from './write-coordinator.ts';
 import { openHermesStoreWithNodeSqlite } from './providers/hermes-node.ts';
+import { openOpencodeDatabaseWithNodeSqlite } from './providers/opencode-node.ts';
 
 export { buildIndex, DB_PATH };
 
@@ -44,36 +45,40 @@ interface InvocationOptions {
   invocationNonce?: string | readonly (string | { value: string; strict?: boolean })[];
 }
 
-interface InventoryIssue {
+interface IndexIssue {
   provider?: unknown;
   path?: unknown;
   error?: unknown;
 }
 
-function reportIncompleteInventory(build: unknown): void {
-  if (build === null || typeof build !== 'object' || !('inventoryIssues' in build)) return;
-  const issues = (build as { inventoryIssues?: unknown }).inventoryIssues;
-  if (!Array.isArray(issues)) return;
-  for (const value of issues) {
-    const issue = value as InventoryIssue | null;
-    if (
-      issue !== null
-      && typeof issue.provider === 'string'
-      && typeof issue.path === 'string'
-      && typeof issue.error === 'string'
-    ) {
-      process.stderr.write(
-        `Warning: incomplete ${issue.provider} source inventory at ${issue.path}: ${issue.error}\n`,
-      );
+function reportIndexIssues(build: unknown): void {
+  if (build === null || typeof build !== 'object') return;
+  const result = build as { inventoryIssues?: unknown; skippedFiles?: unknown };
+  for (const kind of ['inventoryIssues', 'skippedFiles'] as const) {
+    const issues = result[kind];
+    if (!Array.isArray(issues)) continue;
+    for (const value of issues) {
+      if (value === null || typeof value !== 'object') continue;
+      const issue = value as IndexIssue;
+      if (
+        typeof issue.provider === 'string'
+        && typeof issue.path === 'string'
+        && typeof issue.error === 'string'
+      ) {
+        process.stderr.write(kind === 'inventoryIssues'
+          ? `Warning: incomplete ${issue.provider} source inventory at ${issue.path}: ${issue.error}\n`
+          : `Warning: skipped ${issue.provider} artifact ${issue.path}: ${issue.error}\n`);
+      }
     }
   }
 }
 
-function refreshQueryIndex(): ProviderRegistry {
+function refreshQueryIndex(): { providerRegistry: ProviderRegistry; invocationWaitOptions?: InvocationWaitOptions } {
   const settings = readPersistedProviderSettings();
   const providerRegistry = createConfiguredBuiltinProviderRuntime(settings.settings, {
     openCopilotChronicle: openCopilotChronicleWithNodeSqlite,
     openHermesStore: openHermesStoreWithNodeSqlite,
+    openOpencodeDatabase: openOpencodeDatabaseWithNodeSqlite,
   }).registry;
   if (!settings.ok) {
     const schema = ensureReadableSchema();
@@ -81,14 +86,21 @@ function refreshQueryIndex(): ProviderRegistry {
       throw new Error(`Obelisk index schema upgrade is blocked by ${schema.reason ?? 'an unknown writer'}`);
     }
     process.stderr.write(`Warning: ${settings.error}; index refresh skipped\n`);
-    return providerRegistry;
+    return {
+      providerRegistry,
+      // The nonce recovery passes a registry directly to buildIndex, bypassing
+      // its settings read. Unknown settings must disable that write path too.
+      // Keep immediate read-only nonce resolution and existing indexed queries,
+      // but do not build/poll for freshness we cannot safely provide.
+      invocationWaitOptions: { build: () => undefined, pollCapMs: 0 },
+    };
   }
   // The pre-query refresh is a full-inventory pass, and for a CLI-only user
   // it is their reconciliation: there is no watcher to reconcile against.
   // It therefore verifies prefixes (strict) instead of trusting cooperative
   // append checkpoints (RFC #172).
-  reportIncompleteInventory(buildIndex({ providerRegistry, readMode: 'strict' }));
-  return providerRegistry;
+  reportIndexIssues(buildIndex({ providerRegistry, readMode: 'strict' }));
+  return { providerRegistry };
 }
 
 function rethrowUnlessSchemaBlocked(error: unknown): never {
@@ -99,9 +111,11 @@ function rethrowUnlessSchemaBlocked(error: unknown): never {
   throw error;
 }
 
-// Run a user-supplied CodeAct script inside the query/attune sandbox. The script
-// body runs as an async IIFE with a 30s timeout; its `return` value is resolved.
-function runInSandbox(api: SandboxApi, scriptContent: string): Promise<unknown> {
+// Run a user-supplied CodeAct script. The script body runs as an async IIFE
+// with a 30s timeout; its `return` value is resolved. This uses node:vm for
+// convenience scoping, not as a security boundary — see
+// https://nodejs.org/api/vm.html#vm-executing-javascript
+function runCodeActScript(api: SandboxApi, scriptContent: string): Promise<unknown> {
   const sandbox = {
     ...api, JSON, Math, Array, Object, Set, Map, Date, RegExp,
     parseInt, parseFloat, String, Number, Boolean, Error, Promise, console, setTimeout,
@@ -247,6 +261,18 @@ function resolveSingleInvocationNonce(
   return ranked[0].sessionId;
 }
 
+// `DISTINCT session_id` makes an index ordered by session_id look attractive,
+// so the planner picks idx_messages_session and scans every row of `messages`
+// — a cost proportional to total history rather than to the recency window
+// (#220: ~37s per `--query` call on a 4.7GB index). Callers collect into a
+// Set, so deduplicating in SQL buys nothing; without it the planner drives
+// from idx_messages_time and the scan stays bounded by the window. The
+// tool_calls leg avoids the same trap with CROSS JOIN.
+export const RECENT_CLI_INVOKER_MESSAGES_SQL = `
+      SELECT session_id FROM messages
+      WHERE timestamp >= ? AND (text LIKE ? OR text LIKE ?)
+    `;
+
 // Sessions holding a recent record of an actual CLI invocation (`obelisk
 // --query ...` / `obelisk --search ...` in a tool-call command line or message
 // text). Bounded to the same recency window as the nonce legs.
@@ -268,10 +294,7 @@ function recentCliInvokerSessions(
     }
   }
   if (indexedTables.has('messages')) {
-    const rows = db.prepare(`
-      SELECT DISTINCT session_id FROM messages
-      WHERE timestamp >= ? AND (text LIKE ? OR text LIKE ?)
-    `).all(cutoff, ...patterns);
+    const rows = db.prepare(RECENT_CLI_INVOKER_MESSAGES_SQL).all(cutoff, ...patterns);
     for (const row of rows) {
       if (typeof row.session_id === 'string') invokers.add(row.session_id);
     }
@@ -377,7 +400,7 @@ export function resolveInvokingSessionIdWithWait(
   const immediate = tryResolve();
   if (immediate) return immediate;
   if (schemaReady()) {
-    reportIncompleteInventory(build());
+    reportIndexIssues(build());
     const afterBuild = tryResolve();
     if (afterBuild) return afterBuild;
   }
@@ -405,8 +428,8 @@ function reportInvocationWaitExhausted(capMs: number): void {
 
 // FTS search over indexed message text. Refreshes the index, then queries.
 export function searchText(text: string, opts?: Record<string, unknown>, invocation?: InvocationOptions): unknown {
-  const providerRegistry = refreshQueryIndex();
-  const invokingSessionId = resolveInvokingSessionIdWithWait(invocation?.invocationNonce, providerRegistry);
+  const { providerRegistry, invocationWaitOptions } = refreshQueryIndex();
+  const invokingSessionId = resolveInvokingSessionIdWithWait(invocation?.invocationNonce, providerRegistry, invocationWaitOptions);
   // Query against a freshly opened snapshot so results reflect the latest
   // published index.
   const db = openReadDb();
@@ -423,12 +446,12 @@ export function searchText(text: string, opts?: Record<string, unknown>, invocat
 
 // Execute a read-only CodeAct query script and resolve its returned value.
 export async function executeQuery(scriptContent: string, invocation?: InvocationOptions): Promise<unknown> {
-  const providerRegistry = refreshQueryIndex();
-  const invokingSessionId = resolveInvokingSessionIdWithWait(invocation?.invocationNonce, providerRegistry);
+  const { providerRegistry, invocationWaitOptions } = refreshQueryIndex();
+  const invokingSessionId = resolveInvokingSessionIdWithWait(invocation?.invocationNonce, providerRegistry, invocationWaitOptions);
   const db = openReadDb();
   try {
     try {
-      return await runInSandbox(createQueryApi(db, { providerRegistry, invokingSessionId }), scriptContent);
+      return await runCodeActScript(createQueryApi(db, { providerRegistry, invokingSessionId }), scriptContent);
     } catch (error) {
       return rethrowUnlessSchemaBlocked(error);
     }
@@ -463,7 +486,7 @@ export async function executeAttune(scriptContent: string): Promise<unknown> {
     // retryable transaction wrapper, so lock contention is waited out by the
     // same budget instead of failing the open with a misleading error.
     runMutation(() => probeAttuneMemoryLayer(db));
-    return await runInSandbox(createAttuneApi(db, runMutation), scriptContent);
+    return await runCodeActScript(createAttuneApi(db, runMutation), scriptContent);
   } finally {
     db.close();
   }

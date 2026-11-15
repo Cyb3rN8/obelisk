@@ -92,7 +92,7 @@ interface IndexerServiceOptions {
   logger?: { warn?: (msg: string) => void };
 }
 
-const TRANSCRIPT_SUFFIXES = ['.jsonl.zstd', '.jsonl', '.json'] as const;
+const TRANSCRIPT_SUFFIXES = ['.jsonl.zstd', '.jsonl.zst', '.jsonl', '.json'] as const;
 
 function isTreeTranscriptCandidate(targetPath: string): boolean {
   return TRANSCRIPT_SUFFIXES.some((suffix) => targetPath.endsWith(suffix));
@@ -102,7 +102,10 @@ function isDeclaredTreeFile(targetPath: string, targets: readonly WatchTarget[])
   const normalized = path.normalize(targetPath);
   const basename = path.basename(normalized);
   return targets.some(target => {
-    if (target.kind !== 'tree' || !target.fileNames?.includes(basename)) return false;
+    if (target.kind !== 'tree') return false;
+    const matches = target.fileNames?.includes(basename) === true
+      || target.matches?.(basename) === true;
+    if (!matches) return false;
     const relative = path.relative(path.normalize(target.path), normalized);
     return relative.length > 0 && !path.isAbsolute(relative)
       && relative !== '..' && !relative.startsWith(`..${path.sep}`);
@@ -446,8 +449,12 @@ function createIndexerService({
     }
     heartbeatTimer = null;
     reconcileTimer = null;
-    if (watcher?.close) watcher.close();
+    const closed = watcher?.close ? Promise.resolve(watcher.close()) : Promise.resolve();
     watcher = null;
+    // Existing fire-and-forget callers remain safe; update cleanup awaits this
+    // promise and observes failures instead of quitting across a live watcher.
+    void closed.catch(() => {});
+    return closed;
   };
 
   return {

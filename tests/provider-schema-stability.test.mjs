@@ -12,11 +12,10 @@ test('canonical transcript persistence schema changes only by explicit decision'
   const schema = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url));
   assert.equal(
     createHash('sha256').update(schema).digest('hex'),
-    // 2026-08-24: indexed Activity queries and the visible main session timeline.
-    // LOCAL: this branch also carries tool_errors_fts, so the pin diverges from
-    // upstream's 0417d1a0... by exactly that table.
-    // 2026-09-02: added session_edges (handoff lineage derivation, refreshHandoffEdges).
-    '544125f4705e3e7e1f42eee5a8f7f1fcbc000e634c4f0b241fd6890fc545c8a1',
+    // 2026-11-15: merged upstream's retained-unit checkpoint columns (upstream pin 71c4ecef...).
+    // LOCAL: this branch also carries tool_errors_fts and session_edges, so the pin
+    // diverges from upstream's by exactly those tables.
+    'b85051f13475aa286756d82453a6319716c600e5414ee7450e127a2f74cae9e8',
   );
 });
 

@@ -3,10 +3,13 @@
 
 <script setup>
 import { ref, onMounted, onBeforeUnmount, nextTick } from 'vue';
+import UpdatePanel from '../components/UpdatePanel.vue';
 
 defineOptions({ name: 'Settings' });
 
 const sources = ref([]);
+const copilotEditions = ref([]);
+const copilotCustomRoot = ref(false);
 const dbPath = ref('');
 const recapPath = ref('');
 const autoRefresh = ref(true);
@@ -23,8 +26,12 @@ const editorMenuOpen = ref(false);
 const memoryCount = ref(0);
 const rebuilding = ref(false);
 const rebuildError = ref('');
+const settingsRecovery = ref('');
+const saveError = ref('');
 const version = ref('');
 let stopIndexUpdates = null;
+let settingsRequestVersion = 0;
+let settingsLoaded = false;
 
 onMounted(async () => {
   stopIndexUpdates = window.obelisk?.onIndexUpdated?.(() => {
@@ -44,14 +51,22 @@ onBeforeUnmount(() => {
 
 async function loadSettings({ preserveRecapPath = false } = {}) {
   if (!window.obelisk?.getSettings) return;
+  const requestVersion = ++settingsRequestVersion;
   const s = await window.obelisk.getSettings();
+  if (requestVersion !== settingsRequestVersion) return;
   sources.value = s.sources || [];
+  copilotEditions.value = s.copilotEditions || [];
+  copilotCustomRoot.value = s.copilotCustomRoot === true;
   dbPath.value = s.dbPath || '';
-  if (!preserveRecapPath) recapPath.value = s.recapDir || '~/.obelisk/recap';
+  // The first accepted snapshot initializes the form even during a refresh.
+  preserveRecapPath = preserveRecapPath && settingsLoaded;
+  if (!preserveRecapPath) recapPath.value = s.recapDir || '';
   autoRefresh.value = s.autoRefresh !== false;
   editorScheme.value = s.editorScheme || 'vscode';
   memoryCount.value = s.memoryCount || 0;
+  settingsRecovery.value = s.settingsRecovery || '';
   version.value = s.version || '';
+  settingsLoaded = true;
 }
 
 async function saveEditorScheme(value) {
@@ -85,6 +100,17 @@ async function browseSourcePath(source) {
   }
 }
 
+async function toggleCopilotEdition(edition, enabled) {
+  edition.enabled = enabled;
+  await saveSetting(`copilotEditions.${edition.id}`, enabled);
+  await loadSettings();
+}
+
+async function restoreCopilotDefaults() {
+  await saveSetting('providerRoots.copilot', null);
+  await loadSettings();
+}
+
 async function browseRecapPath() {
   if (!window.obelisk?.browseFolder) return;
   const result = await window.obelisk.browseFolder();
@@ -100,8 +126,19 @@ async function toggleAutoRefresh() {
 }
 
 async function saveSetting(key, value) {
-  if (window.obelisk?.setSetting) {
-    await window.obelisk.setSetting(key, value);
+  if (!window.obelisk?.setSetting) return;
+  try {
+    // The save response carries the recovery notice: saving is what moves a rejected file
+    // aside, and the paths that save without reloading settings (editor, recap directory,
+    // auto-refresh) would otherwise never see it.
+    const result = await window.obelisk.setSetting(key, value);
+    settingsRecovery.value = result?.settingsRecovery || '';
+    saveError.value = '';
+  } catch (error) {
+    // A save is refused when the settings file could not be preserved first. Saying so is
+    // the whole point of refusing: the file is untouched, and silence would look like it
+    // was written.
+    saveError.value = error instanceof Error ? error.message : String(error);
   }
 }
 
@@ -154,6 +191,16 @@ function fmtRelative(iso) {
           <p>Where Obelisk reads your agent session history.</p>
         </div>
 
+        <div v-if="saveError" class="status-row error settings-save-error">
+          <span class="status-dot error"></span>
+          <span>{{ saveError }}</span>
+        </div>
+
+        <div v-if="settingsRecovery" class="status-row warn settings-recovery">
+          <span class="status-dot warn"></span>
+          <span>{{ settingsRecovery }}</span>
+        </div>
+
         <div
           v-for="src in sources" :key="src.id"
           class="source-card"
@@ -183,7 +230,16 @@ function fmtRelative(iso) {
             </div>
           </div>
           <div class="source-card-body">
-            <div class="path-input">
+            <div v-if="src.id === 'copilot' && !copilotCustomRoot" class="copilot-editions">
+              <label v-for="edition in copilotEditions" :key="edition.id" class="copilot-edition">
+                <input type="checkbox" :checked="edition.enabled" @change="toggleCopilotEdition(edition, $event.target.checked)" />
+                <span class="copilot-edition-details">
+                  <span>{{ edition.name }}</span>
+                  <span class="copilot-edition-path">{{ edition.path }}</span>
+                </span>
+              </label>
+            </div>
+            <div v-if="src.id !== 'copilot' || copilotCustomRoot" class="path-input">
               <input class="path-field" :class="{ error: src.status === 'error' }" type="text" :value="src.path" spellcheck="false" readonly/>
               <button class="btn" @click="browseSourcePath(src)">
                 <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round">
@@ -191,6 +247,10 @@ function fmtRelative(iso) {
                 </svg>
                 Browse…
               </button>
+            </div>
+            <div v-if="src.id === 'copilot'" class="copilot-actions">
+              <button v-if="!copilotCustomRoot" class="btn" @click="browseSourcePath(src)">Choose custom folder</button>
+              <button v-else class="btn" @click="restoreCopilotDefaults">Use VS Code folders</button>
             </div>
           </div>
         </div>
@@ -317,6 +377,10 @@ function fmtRelative(iso) {
           </div>
         </div>
         <div class="form-row">
+          <div class="form-label">Updates</div>
+          <div class="form-control"><UpdatePanel /></div>
+        </div>
+        <div class="form-row">
           <div class="form-label">Reset</div>
           <div class="form-control">
             <div class="reset-actions">
@@ -396,6 +460,12 @@ function fmtRelative(iso) {
 .source-card-status .sep { color: var(--muted-3); }
 .source-card-status strong { color: var(--fg-2); font-weight: 500; }
 .source-card-body { display: flex; flex-direction: column; gap: 10px; }
+.copilot-editions { display: grid; gap: 10px; }
+.copilot-edition { display: flex; align-items: center; gap: 9px; cursor: pointer; min-width: 0; }
+.copilot-edition input { flex: none; accent-color: var(--accent); }
+.copilot-edition-details { display: flex; flex-direction: column; min-width: 0; gap: 2px; font-size: 12px; }
+.copilot-edition-path { color: var(--muted); font-family: var(--font-mono); font-size: 11px; overflow-wrap: anywhere; }
+.copilot-actions { display: flex; }
 
 .form-row {
   display: grid; grid-template-columns: 180px 1fr;
@@ -484,6 +554,9 @@ function fmtRelative(iso) {
 .status-row.ok { border-color: rgba(52,211,153,0.20); background: rgba(52,211,153,0.04); }
 .status-row.warn { border-color: rgba(251,191,36,0.20); background: rgba(251,191,36,0.04); }
 .status-row.error { border-color: rgba(248,113,113,0.20); background: rgba(248,113,113,0.04); }
+/* #42: one-line notices about the settings file itself -- a rejected file moved aside before
+   being replaced, and a save that was refused because the file could not be preserved. */
+.settings-recovery, .settings-save-error { margin-bottom: 10px; word-break: break-all; }
 
 .status-dot {
   width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0;

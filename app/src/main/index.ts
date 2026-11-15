@@ -14,23 +14,35 @@ import { createWorkerBuildIndex } from './indexer-worker-client.ts';
 import { buildRecapExportQuery } from './recap-capture-query.ts';
 import { buildEditorUrl, DEFAULT_EDITOR_SCHEME, EDITOR_SCHEMES, resolveFileReference } from './file-reference.ts';
 import { createDeferredQuit } from './quit-teardown.ts';
+import { createUpdateLifecycle } from './update-lifecycle.ts';
+import { createUpdateService } from './update-service.ts';
 import { acquireWriterLease, writerLockPathFor } from '../../../packages/core/src/writer-lease.ts';
 import { migrateCoreSchemaColumns, migrateFtsTokenizer, resolveFtsTokenizer } from '../../../packages/core/src/schema-migrations.ts';
 import { storedSessionCursor } from '../../../packages/core/src/provider-indexing.ts';
 import { createBuiltinProviderRegistry } from '../../../packages/core/src/providers/builtins.ts';
 import {
   createConfiguredBuiltinProviderRuntime,
+  getCopilotEditions,
+  hasExplicitProviderRoot,
   readPersistedProviderSettings,
 } from '../../../packages/core/src/provider-settings.ts';
+import {
+  resolveObeliskPaths,
+  warnLegacyStorageIgnored,
+} from '../../../packages/core/src/paths.ts';
 import {
   buildSourceCatalog,
   setPersistedSetting,
   type ProviderSourceIssue,
 } from './provider-settings.ts';
+import { preserveRejectedSettings } from './settings-preservation.ts';
 import type {
   SessionPatchCursor,
   SessionPatchSnapshot,
   SessionMetadata,
+  SessionCatalogueOptions,
+  ActivitySessionsOptions,
+  SessionsQueryOptions,
   SourceQueryOptions,
   WindowControlAction,
 } from '../shared/ipc-types.ts';
@@ -47,6 +59,11 @@ import { createSessionPatch } from '../shared/session-patch.mjs';
 import { assembleSessionDetail } from '../shared/session-detail-assembly.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const OBELISK_PATHS = resolveObeliskPaths();
+const OBELISK_DIR = OBELISK_PATHS.dataDir;
+const RECAP_DIR = OBELISK_PATHS.recapDir;
+const SETTINGS_PATH = OBELISK_PATHS.settingsPath;
+let legacyStorageWarningShown = false;
 
 function detectClaudeDir() {
   // macOS / Linux: ~/.claude
@@ -78,6 +95,11 @@ let indexerService;
 let indexerWorker;
 let latestSourceIssues: ProviderSourceIssue[] = [];
 let latestSettingsError: string | null = null;
+// A recovery notice is deliberately kept apart from latestSettingsError: that variable
+// also gates the indexer (startIndexerService, migrations, rebuildIndex all treat a
+// non-null value as "settings unusable"). Once a corrupt file has been moved aside the
+// settings ARE usable again, so the notice must not block those paths.
+let latestSettingsRecovery: string | null = null;
 
 type WriterLeaseMode = 'acquire' | 'caller-held';
 
@@ -104,6 +126,11 @@ function getRuntimePaths(persisted = loadPersistedSettings()) {
       fileMustExist: true,
       timeout: 500,
     }),
+    openKiroDatabase: sourcePath => new Database(sourcePath, {
+      readonly: true,
+      fileMustExist: true,
+      timeout: 500,
+    }),
   });
   const providerRoots = runtime.roots;
   const providerRegistry = runtime.registry;
@@ -115,7 +142,10 @@ function getRuntimePaths(persisted = loadPersistedSettings()) {
     providerRegistry,
     claudeDir,
     codexDir,
-    dbPath: path.join(OBELISK_DIR, 'obelisk.sqlite'),
+    configDir: OBELISK_PATHS.configDir,
+    dataDir: OBELISK_PATHS.dataDir,
+    settingsPath: OBELISK_PATHS.settingsPath,
+    dbPath: OBELISK_PATHS.dbPath,
     projectsDir: path.join(claudeDir, 'projects'),
   };
 }
@@ -124,6 +154,12 @@ function migrateLegacyDbIfNeeded(
   paths = getRuntimePaths(),
   { writerLeaseMode = 'acquire' }: { writerLeaseMode?: WriterLeaseMode } = {},
 ) {
+  if (OBELISK_PATHS.layout !== 'legacy') {
+    if (!legacyStorageWarningShown) {
+      legacyStorageWarningShown = warnLegacyStorageIgnored(OBELISK_PATHS) !== null;
+    }
+    return false;
+  }
   if (fs.existsSync(paths.dbPath)) return;
   const legacyDbPath = path.join(paths.claudeDir, 'obelisk.sqlite');
   if (!fs.existsSync(legacyDbPath)) return;
@@ -208,6 +244,12 @@ function openDb(
   if (!fs.existsSync(dbPath)) return null;
   db = new Database(dbPath, { readonly: false });
   db.pragma('busy_timeout = 5000');
+  // Match the catalogue's original JavaScript substring semantics, including
+  // Unicode case conversion and literal %, _ and backslashes.
+  db.function('catalogue_contains', { deterministic: true },
+    (title: string | null, project: string | null, branch: string | null, query: string) =>
+      title?.toLowerCase().includes(query) || project?.toLowerCase().includes(query)
+        || branch?.toLowerCase().includes(query) ? 1 : 0);
   const lease = writerLeaseMode === 'acquire' ? acquireAppWriterLease(dbPath) : null;
   if (writerLeaseMode === 'caller-held' || lease) {
     try {
@@ -221,6 +263,7 @@ function openDb(
 }
 
 function runAppDbWrite(work: () => void): boolean {
+  updateLifecycle.assertWritable();
   if (!db) return false;
   const lease = acquireAppWriterLease(getRuntimePaths().dbPath, 250);
   if (!lease) {
@@ -285,6 +328,7 @@ function appendWhere(sql, params, clause) {
 }
 
 function startIndexerService({ buildOnStart = false } = {}) {
+  if (updateLifecycle.isBlocked()) return null;
   if (indexerService) return indexerService;
   const paths = getRuntimePaths();
   if (latestSettingsError !== null) return null;
@@ -325,12 +369,13 @@ function startIndexerService({ buildOnStart = false } = {}) {
   return service;
 }
 
-function startBackgroundResources({ runStartupBuild = false } = {}) {
+function startBackgroundResources({ runStartupBuild = false, watchSources = true } = {}) {
+  if (updateLifecycle.isBlocked()) return;
   if (!indexerWorker) indexerWorker = createWorkerBuildIndex();
   const paths = getRuntimePaths();
   if (latestSettingsError === null) migrateLegacyDbIfNeeded(paths);
   openDb(paths.dbPath);
-  if (!indexerService && latestSettingsError === null) {
+  if (watchSources && !indexerService && latestSettingsError === null) {
     const service = startIndexerService({ buildOnStart: false });
     if (runStartupBuild) service?.runBuildNow('startup');
   }
@@ -340,12 +385,20 @@ function startBackgroundResources({ runStartupBuild = false } = {}) {
 async function stopIndexerServiceAndWait({ waitForIdle = true } = {}) {
   const service = indexerService;
   if (!service) return;
-  service.stop();
-  if (waitForIdle && typeof service.idle === 'function') await service.idle();
+  const closed = service.stop();
+  const results = await Promise.allSettled([closed, waitForIdle && typeof service.idle === 'function' ? service.idle() : undefined]);
   if (indexerService === service) indexerService = null;
+  const failed = results.find(result => result.status === 'rejected');
+  if (failed?.status === 'rejected') throw failed.reason;
 }
 
-async function stopBackgroundResources({ stopWorker = false } = {}) {
+let resourcesStop: Promise<void> | null = null;
+async function stopBackgroundResources(options: { stopWorker?: boolean } = {}) {
+  if (resourcesStop) return resourcesStop;
+  resourcesStop = stopBackgroundResourcesNow(options);
+  try { await resourcesStop; } finally { resourcesStop = null; }
+}
+async function stopBackgroundResourcesNow({ stopWorker = false } = {}) {
   // Close the ~/.obelisk watcher before the first await. close() flips its
   // `closed` flag synchronously and every parcel event callback guards on it,
   // so once this function yields, no teardown-time FSEvents delivery can
@@ -358,15 +411,22 @@ async function stopBackgroundResources({ stopWorker = false } = {}) {
     obeliskWatcher = null;
     if (obeliskNotifyTimer) { clearTimeout(obeliskNotifyTimer); obeliskNotifyTimer = null; }
     pendingObeliskChanges.clear();
-    if (typeof watcher.close === 'function') watcherClosed = Promise.resolve(watcher.close()).catch(() => {});
+    if (typeof watcher.close === 'function') {
+      watcherClosed = Promise.resolve(watcher.close());
+      // Attach immediately so a rejection during service.idle() is observed.
+      void watcherClosed.catch(() => {});
+    }
   }
-  await stopIndexerServiceAndWait();
+  const results = await Promise.allSettled([stopIndexerServiceAndWait(), watcherClosed]);
   if (stopWorker && indexerWorker) {
-    indexerWorker.stop();
-    indexerWorker = null;
+    const worker = indexerWorker;
+    const termination = await Promise.allSettled([Promise.resolve(worker.stop())]);
+    results.push(...termination);
+    if (indexerWorker === worker) indexerWorker = null;
   }
-  if (watcherClosed) await watcherClosed;
   closeDb();
+  const failed = results.find(result => result.status === 'rejected');
+  if (failed?.status === 'rejected') throw failed.reason;
 }
 
 function safeProtocol(url: string): string {
@@ -458,8 +518,6 @@ function createWindow() {
   }
 }
 
-const OBELISK_DIR = path.join(os.homedir(), '.obelisk');
-const RECAP_DIR = path.join(OBELISK_DIR, 'recap');
 let obeliskWatcher: ReturnType<typeof createAdaptiveWatcher> | null = null;
 let obeliskNotifyTimer: ReturnType<typeof setTimeout> | null = null;
 const pendingObeliskChanges = new Set<string>();
@@ -504,9 +562,39 @@ function onObeliskChange(filePath) {
   }
 }
 
+let appQuitRequested = false;
+const updateLifecycle = createUpdateLifecycle({
+  stop: () => stopBackgroundResources({ stopWorker: true }),
+  resume: () => { if (!appQuitRequested) startBackgroundResources({ watchSources: loadPersistedSettings().autoRefresh !== false }); },
+});
+// Only the shipped amd64 Debian target has a verified Linux update channel.
+// AppImage/source builds and other architectures must not consume its feed.
+const isDebInstall = app.isPackaged && process.platform === 'linux' && process.arch === 'x64' &&
+  await fs.promises.readFile(path.join(process.resourcesPath, 'package-type'), 'utf8')
+    .then(value => value.trim() === 'deb', () => false);
+const updater = createUpdateService({
+  enabled: app.isPackaged === true && (process.platform === 'darwin' || isDebInstall),
+  version: app.getVersion(),
+  createBackend: async receive => {
+    const { createMacUpdateBackend, createDebUpdateBackend } = await import('./update-backends.ts');
+    return process.platform === 'darwin' ? createMacUpdateBackend(receive) : createDebUpdateBackend(receive);
+  },
+  prepare: updateLifecycle.prepare,
+  recover: updateLifecycle.recover,
+  publish: state => {
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (!win.isDestroyed()) win.webContents.send('obelisk:update-state', state);
+    }
+  },
+});
+ipcMain.handle('updates:getState', () => updater.getState());
+ipcMain.handle('updates:check', () => updater.check());
+ipcMain.handle('updates:install', () => updater.install());
+
 app.whenReady().then(() => {
   startBackgroundResources({ runStartupBuild: true });
   createWindow();
+  void updater.check();
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
@@ -521,13 +609,19 @@ app.whenReady().then(() => {
 // frame to catch it, and napi_throw fatals the process (#187). The stop is
 // not cached: a macOS pause (window-all-closed) can be followed by activate →
 // restart, and a later quit must stop the restarted singletons.
-app.on('before-quit', createDeferredQuit({
+const deferOrdinaryQuit = createDeferredQuit({
   quit: () => app.quit(),
   stop: () => stopBackgroundResources({ stopWorker: true }),
-}));
+});
+app.on('before-quit', event => {
+  appQuitRequested = true;
+  if (updateLifecycle.isPrepared()) return;
+  updater.stop();
+  deferOrdinaryQuit(event);
+});
 
 app.on('window-all-closed', () => {
-  void stopBackgroundResources({ stopWorker: true });
+  if (!updateLifecycle.isBlocked()) void stopBackgroundResources({ stopWorker: true }).catch(error => console.warn('Obelisk cleanup failed:', error));
   if (process.platform !== 'darwin') app.quit();
 });
 
@@ -636,9 +730,9 @@ function querySessionMetadata(sessionId: string): SessionMetadata | null {
   ) || null;
 }
 
-ipcMain.handle('db:getSessions', (_, opts = {}) => {
+ipcMain.handle('db:getSessions', (_, opts: SessionsQueryOptions = {}) => {
   if (!db) return [];
-  const { project, limit = 200 } = opts;
+  const { project, sessionId, limit = 200 } = opts;
   let sql = `SELECT ${SESSION_METADATA_COLUMNS} FROM sessions`;
   const params: unknown[] = [];
   const sourceFilter = sourceWhereClause(opts);
@@ -647,9 +741,56 @@ ipcMain.handle('db:getSessions', (_, opts = {}) => {
     params.push(...sourceFilter.params);
   }
   if (project) { sql = appendWhere(sql, params, `project LIKE ?`); params.push(project); }
-  sql += ` ORDER BY COALESCE(ended_at, started_at) DESC LIMIT ?`;
-  params.push(limit);
+  if (sessionId !== undefined) { sql = appendWhere(sql, params, `id = ?`); params.push(sessionId); }
+  sql += ` ORDER BY COALESCE(ended_at, started_at) DESC`;
+  if (limit !== null) {
+    sql += ' LIMIT ?';
+    params.push(limit);
+  }
   return db.prepare(sql).all(...params);
+});
+
+ipcMain.handle('db:getSessionCatalogue', (_, opts: SessionCatalogueOptions = {}) => {
+  if (!db) return { rows: [], total: 0 };
+  const limit = Number.isSafeInteger(opts.limit) ? Math.max(1, Math.min(opts.limit!, 100)) : 100;
+  const offset = Number.isSafeInteger(opts.offset) ? Math.max(0, opts.offset!) : 0;
+  const clauses: string[] = [];
+  const params: unknown[] = [];
+  const sourceFilter = sourceWhereClause(opts);
+  if (sourceFilter.sql) { clauses.push(sourceFilter.sql); params.push(...sourceFilter.params); }
+  if (opts.project && opts.project !== 'all') { clauses.push('project = ?'); params.push(opts.project); }
+  if (opts.quiet) clauses.push("(title IS NULL OR title = '')");
+  else clauses.push("title IS NOT NULL AND title != ''");
+  const query = opts.query?.trim().toLowerCase();
+  if (query) {
+    clauses.push('catalogue_contains(title, project, git_branch, ?)');
+    params.push(query);
+  }
+  const where = `WHERE ${clauses.join(' AND ')}`;
+  const total = (db.prepare(`SELECT COUNT(*) AS count FROM sessions ${where}`).get(...params) as { count: number }).count;
+  const direction = opts.descending === false ? 'ASC' : 'DESC';
+  const rows = db.prepare(`SELECT ${SESSION_METADATA_COLUMNS} FROM sessions ${where}
+    ORDER BY COALESCE(ended_at, started_at) ${direction}, id ${direction} LIMIT ? OFFSET ?`)
+    .all(...params, limit, offset);
+  return { rows, total };
+});
+
+ipcMain.handle('db:getActivitySessions', (_, opts: ActivitySessionsOptions) => {
+  if (!db) return { rows: [], total: 0 };
+  if (!/^\d{4}-\d\d-\d\d/.test(opts?.from) || !/^\d{4}-\d\d-\d\d/.test(opts?.to)) {
+    throw new Error('Activity date range must use ISO dates');
+  }
+  const offset = Number.isSafeInteger(opts.offset) ? Math.max(0, opts.offset!) : 0;
+  const where = 's.started_at < ? AND COALESCE(s.ended_at, s.started_at) >= ?';
+  const params = [opts.to, opts.from];
+  const total = (db.prepare(`SELECT COUNT(*) AS count FROM sessions s WHERE ${where}`).get(...params) as { count: number }).count;
+  const rows = db.prepare(`SELECT ${SESSION_METADATA_COLUMNS.split(', ').map(column => `s.${column}`).join(', ')},
+    EXISTS (SELECT 1 FROM sessions earlier WHERE earlier.project = s.project
+      AND earlier.id != s.id AND earlier.started_at < s.started_at) AS has_earlier
+    FROM sessions s WHERE ${where}
+    ORDER BY COALESCE(s.ended_at, s.started_at) DESC, s.id DESC LIMIT 200 OFFSET ?`)
+    .all(...params, offset);
+  return { rows, total };
 });
 
 ipcMain.handle('db:getSessionMessages', (_, sessionId) => {
@@ -723,8 +864,9 @@ ipcMain.handle('db:getSessionSummaries', (_, sessionId) => {
 ipcMain.handle('db:getMemories', () => {
   if (!db) return [];
   return db.prepare(`
-    SELECT id, session_id, project, message_start, message_end, path, anchors, summary, created_at, deleted_at, deleted_reason
-    FROM memories ORDER BY created_at DESC
+    SELECT m.id, m.session_id, m.project, m.message_start, m.message_end, m.path, m.anchors,
+           m.summary, m.created_at, m.deleted_at, m.deleted_reason, s.title AS session_title
+    FROM memories m LEFT JOIN sessions s ON s.id = m.session_id ORDER BY m.created_at DESC
   `).all();
 });
 
@@ -750,11 +892,15 @@ ipcMain.handle('db:getMessageFullText', async (_, uuid) => {
     workflowAgent,
   };
   // Store-backed source reads belong in the worker: a custom root can live on a slow mount.
-  if (lookup.source === 'zcode' || lookup.source === 'hermes') {
+  if (lookup.source === 'zcode' || lookup.source === 'hermes' || lookup.source === 'kiro' || lookup.source === 'opencode') {
     try {
       const messageText = lookup.source === 'zcode'
         ? await indexerWorker?.readZcodeMessageText(lookup)
-        : await indexerWorker?.readHermesMessageText(lookup);
+        : lookup.source === 'kiro'
+          ? await indexerWorker?.readKiroMessageText({ ...lookup, rootDir: paths.providerRoots.kiro })
+          : lookup.source === 'opencode'
+            ? await indexerWorker?.readOpencodeMessageText(lookup)
+            : await indexerWorker?.readHermesMessageText(lookup);
       return messageText ?? msg.text ?? null;
     } catch {
       return msg.text ?? null;
@@ -995,17 +1141,16 @@ ipcMain.handle('recap:read', (_, filename) => {
 
 // --- Settings ---
 
-const SETTINGS_PATH = path.join(OBELISK_DIR, 'settings.json');
-
-function loadPersistedSettings() {
-  const result = readPersistedProviderSettings(SETTINGS_PATH);
+function loadPersistedSettings(result = readPersistedProviderSettings(SETTINGS_PATH)) {
   latestSettingsError = result.ok ? null : result.error ?? 'Obelisk settings are unavailable';
   if (latestSettingsError !== null) console.warn(latestSettingsError);
   return result.settings;
 }
 
 function savePersistedSettings(settings) {
-  if (!fs.existsSync(OBELISK_DIR)) fs.mkdirSync(OBELISK_DIR, { recursive: true });
+  if (!fs.existsSync(path.dirname(SETTINGS_PATH))) {
+    fs.mkdirSync(path.dirname(SETTINGS_PATH), { recursive: true });
+  }
   const temporaryPath = `${SETTINGS_PATH}.${process.pid}.tmp`;
   try {
     fs.writeFileSync(temporaryPath, JSON.stringify(settings, null, 2));
@@ -1019,10 +1164,21 @@ function savePersistedSettings(settings) {
   }
 }
 
-ipcMain.handle('settings:get', () => {
+ipcMain.handle('settings:get', async () => {
   const persisted = loadPersistedSettings();
   const paths = getRuntimePaths(persisted);
-  const { providerRoots, providerRegistry, claudeDir, codexDir, dbPath: dbFile } = paths;
+  const copilotEditions = getCopilotEditions(persisted);
+  const copilotCustomRoot = hasExplicitProviderRoot(persisted, 'copilot');
+  const {
+    providerRoots,
+    providerRegistry,
+    claudeDir,
+    codexDir,
+    configDir,
+    dataDir,
+    settingsPath,
+    dbPath: dbFile,
+  } = paths;
   const recapDir = persisted.recapDir || RECAP_DIR;
   let memoryCount = 0;
   const sourceStats = new Map<string, { sessionCount: number; lastIndexed: string }>();
@@ -1045,12 +1201,36 @@ ipcMain.handle('settings:get', () => {
       memoryCount = db.prepare('SELECT COUNT(*) as c FROM memories WHERE deleted_at IS NULL').get()?.c || 0;
     } catch {}
   }
+  const selectedCopilotEditions = copilotEditions.filter((edition) => edition.enabled);
+  const sourcePaths = new Set([
+    ...providerRegistry.catalog().map((provider) => providerRoots[provider.id] ?? provider.defaultRoot),
+    ...(!copilotCustomRoot ? selectedCopilotEditions.map((edition) => edition.path) : []),
+  ]);
+  const existingPaths = new Set((await Promise.all([...sourcePaths].map(async (sourcePath) => {
+    try {
+      await fs.promises.access(sourcePath);
+      return sourcePath;
+    } catch {
+      return null;
+    }
+  }))).filter((sourcePath): sourcePath is string => sourcePath !== null));
+  const copilotCatalogRoot = selectedCopilotEditions.find((edition) => existingPaths.has(edition.path))
+    ?? selectedCopilotEditions[0];
   const sources = buildSourceCatalog({
     registry: providerRegistry,
-    roots: providerRoots,
+    roots: copilotCustomRoot ? providerRoots : {
+      ...providerRoots,
+      copilot: copilotCatalogRoot?.path ?? '',
+    },
     stats: sourceStats,
     sourceIssues: latestSourceIssues,
-    pathExists: fs.existsSync,
+    pathExists: (sourcePath) => existingPaths.has(sourcePath),
+  }).map((source) => {
+    if (source.id !== 'copilot' || copilotCustomRoot) return source;
+    if (selectedCopilotEditions.length === 0) {
+      return { ...source, exists: false, status: 'warn', statusText: 'No folders selected' };
+    }
+    return source;
   });
   const sessionCount = sources.reduce((sum, source) => sum + source.sessionCount, 0);
   const lastIndexed = sources.map((source) => source.lastIndexed).filter(Boolean).sort().at(-1) || '';
@@ -1060,8 +1240,13 @@ ipcMain.handle('settings:get', () => {
   return {
     version: app.getVersion(),
     providerRoots,
+    copilotEditions,
+    copilotCustomRoot,
     claudeDir,
     codexDir,
+    configDir,
+    dataDir,
+    settingsPath,
     dbPath: dbFile,
     recapDir,
     autoRefresh: persisted.autoRefresh !== false,
@@ -1072,39 +1257,65 @@ ipcMain.handle('settings:get', () => {
     lastIndexed,
     status: connected ? 'ok' : 'error',
     statusText: latestSettingsError ?? (connected ? 'Connected' : 'No source folders found'),
+    settingsRecovery: latestSettingsRecovery,
   };
 });
 
-ipcMain.handle('settings:set', async (_, key, value) => {
-  const persisted = loadPersistedSettings();
-  const providerRootChanged = setPersistedSetting(persisted, key, value);
-  savePersistedSettings(persisted);
+// A save yields while preserving a rejected file. Keep the complete read/backup/write
+// sequence ordered so another save cannot overwrite a stale snapshot or race its backup.
+// updateLifecycle still tracks queued saves immediately so update cleanup waits for them.
+let settingsWriteTail: Promise<unknown> = Promise.resolve();
+ipcMain.handle('settings:set', (_, key, value) => updateLifecycle.mutate(() => {
+  const write = settingsWriteTail.then(async () => {
+    const currentRead = readPersistedProviderSettings(SETTINGS_PATH);
+    const persisted = loadPersistedSettings(currentRead);
+    // Preserve a file the shared reader rejected before the write below replaces it. Runs
+    // before the save, using this queued write's fresh read rather than latestSettingsError,
+    // so a stale flag from an earlier settings:get cannot skip or repeat it. Throwing here is the
+    // point: with no preserved copy the overwrite is the silent #42 loss.
+    const backupPath = await preserveRejectedSettings(SETTINGS_PATH, {
+      rename: (from, to) => fs.promises.rename(from, to),
+      copyFile: (from, to) => fs.promises.copyFile(from, to),
+    }, currentRead);
+    const providerRootChanged = setPersistedSetting(persisted, key, value);
+    savePersistedSettings(persisted);
+    if (backupPath !== null) {
+      latestSettingsRecovery = `Previous settings could not be read. They were preserved at ${backupPath}`;
+      console.warn(latestSettingsRecovery);
+    }
 
-  if (key === 'autoRefresh') {
-    if (value === false && indexerService) {
+    if (key === 'autoRefresh') {
+      if (value === false && indexerService) {
+        await stopIndexerServiceAndWait();
+      } else if (value !== false) {
+        if (indexerService) await stopIndexerServiceAndWait();
+        startIndexerService({ buildOnStart: true });
+      }
+    }
+
+    const knownLegacyRootChanged = createBuiltinProviderRegistry({
+      claude: DEFAULT_CLAUDE_DIR,
+      codex: DEFAULT_CODEX_DIR,
+    }).catalog().some((provider) => key === `${provider.id}Dir`);
+    if (providerRootChanged || knownLegacyRootChanged) {
       await stopIndexerServiceAndWait();
-    } else if (value !== false) {
-      if (indexerService) await stopIndexerServiceAndWait();
-      startIndexerService({ buildOnStart: true });
+      const paths = getRuntimePaths(persisted);
+      migrateLegacyDbIfNeeded(paths);
+      openDb(paths.dbPath);
+      if (persisted.autoRefresh !== false) {
+        startIndexerService({ buildOnStart: true });
+      }
+      notifyIndexUpdated({ inventoryIssues: [] });
     }
-  }
-
-  const knownLegacyRootChanged = createBuiltinProviderRegistry({
-    claude: DEFAULT_CLAUDE_DIR,
-    codex: DEFAULT_CODEX_DIR,
-  }).catalog().some((provider) => key === `${provider.id}Dir`);
-  if (providerRootChanged || knownLegacyRootChanged) {
-    await stopIndexerServiceAndWait();
-    const paths = getRuntimePaths(persisted);
-    migrateLegacyDbIfNeeded(paths);
-    openDb(paths.dbPath);
-    if (persisted.autoRefresh !== false) {
-      startIndexerService({ buildOnStart: true });
-    }
-    notifyIndexUpdated({ inventoryIssues: [] });
-  }
-  return true;
-});
+    // The save is what moves a rejected file aside, so the notice is returned here as well as
+    // from settings:get: the paths that save without reloading settings (editor, recap
+    // directory, auto-refresh) would otherwise never see it.
+    return { settingsRecovery: latestSettingsRecovery };
+  });
+  // A refused save must not prevent a later retry after the file becomes writable.
+  settingsWriteTail = write.catch(() => {});
+  return write;
+}));
 
 ipcMain.handle('settings:browseFolder', async (event) => {
   const win = BrowserWindow.fromWebContents(event.sender);
@@ -1121,7 +1332,7 @@ ipcMain.handle('settings:revealPath', (_, p) => {
   if (fs.existsSync(p)) shell.showItemInFolder(p);
 });
 
-ipcMain.handle('settings:rebuildIndex', async () => {
+ipcMain.handle('settings:rebuildIndex', () => updateLifecycle.mutate(async () => {
   if (!indexerWorker) return null;
   const persisted = loadPersistedSettings();
   if (latestSettingsError !== null) throw new Error(latestSettingsError);
@@ -1211,4 +1422,4 @@ ipcMain.handle('settings:rebuildIndex', async () => {
       }
     }
   }
-});
+}));
