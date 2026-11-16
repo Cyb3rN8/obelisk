@@ -27,9 +27,13 @@ export function ensureIndexGeneration(db: SqliteDb): void {
     .run(INDEX_GENERATION_KEY, Date.now());
 }
 
-/** Invalidate outstanding cursors: strictly greater than the previous generation. */
-export function renewIndexGeneration(db: SqliteDb): void {
-  const next = Math.max(Date.now(), readIndexGeneration(db) + 1);
+/**
+ * Invalidate outstanding cursors: strictly greater than the previous generation.
+ * A caller that wipes `index_state` first reads the generation beforehand and passes
+ * it as `floor`, since the wipe leaves nothing for the row itself to supply.
+ */
+export function renewIndexGeneration(db: SqliteDb, floor = 0): void {
+  const next = Math.max(Date.now(), readIndexGeneration(db) + 1, Math.trunc(floor) + 1);
   db.prepare('INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES (?, ?, 0)')
     .run(INDEX_GENERATION_KEY, next);
 }

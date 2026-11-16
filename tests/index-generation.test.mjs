@@ -58,6 +58,20 @@ test('renewIndexGeneration strictly increases, even within one millisecond', () 
   }
 });
 
+test('renewIndexGeneration honours a floor saved before index_state was wiped', () => {
+  const db = openSchemaDb();
+  try {
+    const saved = Date.now() + 1e9;
+    db.prepare('INSERT INTO index_state (jsonl_path, mtime, lines_processed) VALUES (?, ?, 0)').run(INDEX_GENERATION_KEY, saved);
+    assert.equal(readIndexGeneration(db), saved);
+    db.prepare('DELETE FROM index_state').run();
+    renewIndexGeneration(db, saved);
+    assert.ok(readIndexGeneration(db) > saved);
+  } finally {
+    db.close();
+  }
+});
+
 test('renewIndexGeneration works without a prior marker', () => {
   const db = openSchemaDb();
   try {
@@ -85,6 +99,15 @@ test('migrateFtsTokenizer renews the generation when it rebuilds the FTS tables'
   }
 });
 
+function lastBuildOf(dbPath) {
+  const db = new DatabaseSync(dbPath, { readOnly: true });
+  try {
+    return db.prepare("SELECT mtime FROM index_state WHERE jsonl_path='__last_build__'").get().mtime;
+  } finally {
+    db.close();
+  }
+}
+
 function generationOf(dbPath) {
   const db = new DatabaseSync(dbPath, { readOnly: true });
   try {
@@ -106,12 +129,15 @@ test('--build keeps the generation across incremental builds, --rebuild renews i
   assert.equal(first.status, 0, first.stderr || first.stdout);
   const g = generationOf(dbPath);
   assert.ok(g > 0, 'first build must create a generation');
+  const firstBuildAt = lastBuildOf(dbPath);
 
   // Touch the transcript so the second build does real incremental work.
   const later = new Date(Date.now() + 60_000);
   utimesSync(transcript, later, later);
   const second = runCli(['--build'], { home });
   assert.equal(second.status, 0, second.stderr || second.stdout);
+  // A skipped build (daemon_active, database_busy) would leave the generation untouched too.
+  assert.ok(lastBuildOf(dbPath) > firstBuildAt, 'second build must actually run');
   assert.equal(generationOf(dbPath), g, 'incremental build must not change the generation');
 
   // LOCAL adaptation: this fork splits the verbs; --rebuild is the force path.

@@ -24,7 +24,7 @@ import {
   writeProviderIndexMarkers,
 } from './provider-indexing.ts';
 import { ftsTokenizerMigrationPending, resolveFtsTokenizer } from './schema-migrations.ts';
-import { ensureIndexGeneration, renewIndexGeneration } from './index-generation.ts';
+import { ensureIndexGeneration, readIndexGeneration, renewIndexGeneration } from './index-generation.ts';
 import { nodeSqliteTransactionAdapter } from './tx.ts';
 import { acquireWriterLease, writerLockPathFor } from './writer-lease.ts';
 import { runRetryableWriteTransaction, isBeginBusyFailure, hasUnusableTransaction } from './write-coordinator.ts';
@@ -345,6 +345,8 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
         try {
           const snapshot = prepareRetainedSnapshot(db, providerPlan.retainedSessions);
           runRetryableWriteTransaction(txDb, () => {
+            // reset() wipes index_state, generation row included; keep the old value as the floor.
+            const previousGeneration = readIndexGeneration(db);
             snapshot.reset();
             const providerResult = indexProviderPlanStrict({
               db,
@@ -358,7 +360,7 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
             refreshHandoffEdges(db);
             ensureFtsReady(db, { force: true });
             db.prepare("INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES ('__last_build__', ?, 0)").run(Date.now());
-            renewIndexGeneration(db);
+            renewIndexGeneration(db, previousGeneration);
             writeProviderIndexMarkers(db, providerPlan, providerResult);
           }, { label: 'force-rebuild' });
           // On failure the outer finally closes this connection and its temp
