@@ -132,13 +132,14 @@ test('--query exposes bounded messages and preserves compatibility globals in th
     page: messages({ sessionId: 'missing', limit: 2 }),
     missing: messages('missing'),
     compatibility: [typeof context, typeof thread, typeof recent, typeof trace, typeof workflows, typeof workflowTree],
+    searchSessionsType: typeof searchSessions,
     rememberType: typeof remember
   };`);
   const result = runRuntime(['--query', scriptPath], { home });
   assert.equal(result.status, 0, result.stderr || result.stdout);
   assert.deepEqual(JSON.parse(result.stdout), {
     page: { anchor: null, messages: [], session: null, hasMore: false, nextCursor: null },
-    missing: null, compatibility: Array(6).fill('function'), rememberType: 'undefined',
+    missing: null, compatibility: Array(6).fill('function'), searchSessionsType: 'function', rememberType: 'undefined',
   });
 });
 

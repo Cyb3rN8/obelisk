@@ -6,6 +6,7 @@ import { statSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { isAbsolute, normalize, resolve, sep } from 'node:path';
 import { constants as sqliteConstants } from 'node:sqlite';
+import { readIndexGeneration } from './index-generation.ts';
 import { storedSessionCursor } from './provider-indexing.ts';
 import { createBuiltinProviderRegistry } from './providers/builtins.ts';
 import { openCopilotChronicleWithNodeSqlite } from './providers/copilot-node.ts';
@@ -588,6 +589,70 @@ function makeSnippet(
   return (start > 0 ? '…' : '') + text.slice(start, end) + (end < text.length ? '…' : '');
 }
 
+interface SearchSessionsOptions {
+  limit?: number;
+  offset?: number;
+  sources?: string[];
+  after?: string;
+  cwdPrefixes?: string[];
+  scope?: 'conversation' | 'all';
+  sort?: 'relevance' | 'newest';
+  snippetChars?: number;
+  fallback?: 'or';
+}
+
+interface SessionSearchHit {
+  sessionId: string;
+  source: string;
+  nativeSessionId: string | null;
+  title: string | null;
+  gitBranch: string | null;
+  updatedAt: string | null;
+  messageCount: number;
+  cwd: string | null;
+  transcriptPath: string | null;
+  transcriptIndexed: boolean;
+  score: number;
+  hit: {
+    uuid: string;
+    role: string;
+    contentType: string | null;
+    timestamp: string | null;
+    snippet: string;
+    highlights: Array<[number, number]>;
+  };
+}
+
+interface SearchSessionsResult {
+  sessions: SessionSearchHit[];
+  hasMore: boolean;
+  generation: number;
+  degraded: string | null;
+}
+
+// Every case-insensitive occurrence of a query term in `text`, sorted by start.
+// Overlapping ranges (one term inside another) are merged so the result never
+// overlaps; adjacent ranges stay separate. A regex on the original string keeps
+// the offsets right where lowercasing would change the string's length.
+function highlightRanges(text: string, terms: string[]): Array<[number, number]> {
+  const ranges: Array<[number, number]> = [];
+  for (const term of new Set(terms)) {
+    if (!term) continue;
+    const re = new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'giu');
+    for (const match of text.matchAll(re)) {
+      ranges.push([match.index, match.index + match[0].length]);
+    }
+  }
+  ranges.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const merged: Array<[number, number]> = [];
+  for (const range of ranges) {
+    const last = merged[merged.length - 1];
+    if (last && range[0] < last[1]) last[1] = Math.max(last[1], range[1]);
+    else merged.push([range[0], range[1]]);
+  }
+  return merged;
+}
+
 function createQueryApi(
   db: SqliteDb,
   {
@@ -774,6 +839,166 @@ function createQueryApi(
       if (degraded) result.degraded = degraded;
       return result;
     });
+  };
+
+  // One row per session, matched exactly as search() matches messages: the same
+  // planMessageMatch plans run through runFirstWorkingPlan, with the plan's
+  // matches grouped by session before ordering and paging, so a session with
+  // hundreds of hits takes one row. Session-level filters are appended to the
+  // plan's WHERE; they narrow which messages count, never how text matches.
+  const searchSessions = (text: string, opts: SearchSessionsOptions = {}): SearchSessionsResult => {
+    const {
+      limit = 20,
+      offset = 0,
+      sources,
+      after,
+      cwdPrefixes,
+      scope = 'all',
+      sort = 'relevance',
+      snippetChars = 160,
+      fallback,
+    } = opts;
+    if (!Number.isInteger(limit) || limit < 0 || limit > 200) {
+      throw new RangeError(`searchSessions() limit must be an integer from 0 to 200 (got ${limit})`);
+    }
+    if (!Number.isInteger(offset) || offset < 0) {
+      throw new RangeError(`searchSessions() offset must be a non-negative integer (got ${offset})`);
+    }
+    if (!Number.isInteger(snippetChars) || snippetChars < 1) {
+      throw new RangeError(`searchSessions() snippetChars must be a positive integer (got ${snippetChars})`);
+    }
+    if (scope !== 'all' && scope !== 'conversation') {
+      throw new RangeError(`searchSessions() scope must be 'conversation' or 'all' (got ${String(scope)})`);
+    }
+    if (sort !== 'relevance' && sort !== 'newest') {
+      throw new RangeError(`searchSessions() sort must be 'relevance' or 'newest' (got ${String(sort)})`);
+    }
+
+    // Message-level conditions, appended to the plan's bare WHERE.
+    let extraWhere = ' AND s.id IS NOT NULL';
+    const extraParams: unknown[] = [];
+    if (sources?.length) {
+      extraWhere += ` AND COALESCE(s.source, 'claude') IN (${sources.map(() => '?').join(',')})`;
+      extraParams.push(...sources);
+    }
+    if (after) {
+      extraWhere += ' AND COALESCE(s.ended_at, s.started_at) >= ?';
+      extraParams.push(after);
+    }
+    if (scope === 'conversation') {
+      extraWhere += " AND m.content_type = 'text' AND m.role IN ('user', 'assistant')";
+    }
+
+    // Session-level conditions on the grouped rows. A prefix matches the cwd
+    // itself or anything below it at a path-segment boundary.
+    const firstCwd = (alias: string) => `(SELECT m_c.cwd FROM messages m_c
+      WHERE m_c.session_id = ${alias}.id AND m_c.cwd IS NOT NULL AND m_c.cwd <> ''
+      ORDER BY m_c.timestamp LIMIT 1)`;
+    const prefixes = (cwdPrefixes ?? []).filter((prefix) => typeof prefix === 'string' && prefix !== '');
+    let pageWhere = '1=1';
+    const pageParams: unknown[] = [];
+    if (prefixes.length) {
+      pageWhere = `(${prefixes.map(() => '(c.cwd = ? OR substr(c.cwd, 1, length(?)) = ?)').join(' OR ')})`;
+      for (const prefix of prefixes) {
+        const below = prefix.endsWith('/') ? prefix : `${prefix}/`;
+        pageParams.push(prefix, below, below);
+      }
+    }
+
+    const order = sort === 'newest'
+      ? 'updated_at DESC, sid'
+      : 'score DESC, updated_at DESC, sid';
+    const pageSql = (plan: MessageMatchPlan) => {
+      // The bare m.uuid is taken from the row that produced the MIN/MAX
+      // (SQLite's documented bare-column rule): the best-ranked message under
+      // MATCH, the newest under a LIKE scan, which has no rank.
+      const pick = plan.rankExpr === 'NULL'
+        ? 'NULL AS best, MAX(m.timestamp) AS newest'
+        : `MIN(${plan.rankExpr}) AS best`;
+      return `
+        WITH hits AS (
+          SELECT m.session_id AS sid, m.uuid AS hit_uuid, ${pick}
+          FROM ${plan.from}
+          WHERE ${plan.where}${extraWhere}
+          GROUP BY m.session_id
+        ),
+        page AS (
+          SELECT c.sid, c.hit_uuid, c.score, c.updated_at
+          FROM (
+            SELECT h.sid, h.hit_uuid, COALESCE(-h.best, 0) AS score,
+                   COALESCE(s.ended_at, s.started_at) AS updated_at
+                   ${prefixes.length ? `, ${firstCwd('s')} AS cwd` : ''}
+            FROM hits h
+            JOIN sessions s ON s.id = h.sid
+          ) c
+          WHERE ${pageWhere}
+          ORDER BY ${order}
+          LIMIT ? OFFSET ?
+        )
+        SELECT p.sid, p.score, p.updated_at, s.source, s.git_branch, s.message_count, s.jsonl_path,
+               ${titleExpr('s')} AS title,
+               ${firstCwd('s')} AS cwd,
+               EXISTS (SELECT 1 FROM index_state i WHERE i.jsonl_path = s.jsonl_path) AS transcript_indexed,
+               hm.uuid AS hit_uuid, hm.role AS hit_role, hm.content_type AS hit_content_type,
+               hm.timestamp AS hit_timestamp, hm.text AS hit_text
+        FROM page p
+        JOIN sessions s ON s.id = p.sid
+        JOIN messages hm ON hm.uuid = p.hit_uuid
+        ORDER BY ${order}`;
+    };
+    const runPage = (pageLimit: number, pageOffset: number) => (plan: MessageMatchPlan): DbRow[] =>
+      db.prepare(pageSql(plan)).all(...plan.params, ...extraParams, ...pageParams, pageLimit, pageOffset);
+
+    const filters: MatchFilters = {};
+    const primary = runFirstWorkingPlan(
+      planMessageMatch(db, text, filters, 'primary'), runPage(limit + 1, offset), [] as DbRow[]);
+    let rows = primary.value;
+    if (fallback === 'or' && rows.length === 0) {
+      // Same rule as search(): broaden only when the primary query matched no
+      // session at all. An empty page past the end of a real result is not that.
+      const primaryEmpty = offset === 0 || primary.plan.mode === 'none'
+        || runPage(1, 0)(primary.plan).length === 0;
+      if (primaryEmpty) {
+        rows = runFirstWorkingPlan(
+          planMessageMatch(db, text, filters, 'or-fallback'), runPage(limit + 1, offset), [] as DbRow[]).value;
+      }
+    }
+
+    const hasMore = rows.length > limit;
+    const terms = queryTokens(text);
+    const before = Math.floor(snippetChars / 3);
+    const sessionsOut = rows.slice(0, limit).map((r: DbRow): SessionSearchHit => {
+      const source = r.source == null || r.source === '' ? 'claude' : String(r.source);
+      const hitText = String(r.hit_text ?? '');
+      const snippet = makeSnippet(hitText, terms, before, snippetChars - before) ?? hitText.slice(0, snippetChars);
+      return {
+        sessionId: String(r.sid),
+        source,
+        nativeSessionId: source === 'claude' ? String(r.sid) : null,
+        title: r.title == null ? null : String(r.title),
+        gitBranch: r.git_branch == null ? null : String(r.git_branch),
+        updatedAt: r.updated_at == null ? null : String(r.updated_at),
+        messageCount: Number(r.message_count ?? 0),
+        cwd: r.cwd == null ? null : String(r.cwd),
+        transcriptPath: r.jsonl_path == null ? null : String(r.jsonl_path),
+        transcriptIndexed: Boolean(r.transcript_indexed),
+        score: Number(r.score),
+        hit: {
+          uuid: String(r.hit_uuid),
+          role: String(r.hit_role ?? ''),
+          contentType: r.hit_content_type == null ? null : String(r.hit_content_type),
+          timestamp: r.hit_timestamp == null ? null : String(r.hit_timestamp),
+          snippet,
+          highlights: highlightRanges(snippet, terms),
+        },
+      };
+    });
+    return {
+      sessions: sessionsOut,
+      hasMore,
+      generation: readIndexGeneration(db),
+      degraded: primary.plan.degraded,
+    };
   };
 
   const messages = (input: MessageQueryOptions | string) => {
@@ -1351,7 +1576,7 @@ function createQueryApi(
     `).all(...params);
   };
 
-  return { sql: q, search, messages, context, trace, thread, subagents, workflows, workflowTree, fileHistory, failures, sessions, recent, summaries, raw, memories, overview };
+  return { sql: q, search, searchSessions, messages, context, trace, thread, subagents, workflows, workflowTree, fileHistory, failures, sessions, recent, summaries, raw, memories, overview };
 }
 
 function createAttuneApi(db: SqliteDb, runMutation: <T>(work: () => T) => T = (work) => work()) {

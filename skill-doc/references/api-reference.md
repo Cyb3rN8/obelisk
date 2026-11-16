@@ -67,7 +67,7 @@ overview, sessions, search, messages, memories, summaries, sql
 ```
 
 Specialized globals remain available: `fileHistory`, `failures`, `subagents`,
-and `raw`. Compatibility globals remain available with their previous behavior:
+`raw`, and `searchSessions` (one row per session, for host apps). Compatibility globals remain available with their previous behavior:
 `context`, `thread`, `recent`, `trace`, `workflows`, and `workflowTree`.
 They are not part of the default teaching surface. `recent` is deprecated;
 use `sessions({ limit: n })` instead.
@@ -196,6 +196,68 @@ behavior, short terms included.
 `fallback: 'or'` is opt-in and does not alter a non-empty primary result. Use it
 for semantic-history recall, not exact scopes or sentinels where zero hits carry
 meaning. The retry retains all structural, visibility, and meta filters.
+
+#### `searchSessions(text, opts?)`
+
+Session-level search for hosts that list one row per session (a sidebar, a
+picker). Matching is exactly `search()`'s — same FTS5 syntax handling, trigram
+short-token guard, LIKE scan, and `fallback: 'or'` — but the matches are grouped
+by session before ordering and paging, so a session with hundreds of hits takes
+one row. Meta rows and superseded rows are excluded, as in `search()`'s defaults;
+messages whose session row is missing are skipped.
+
+| Param | Type | Description |
+| --- | --- | --- |
+| `text` | `string` | Query, same syntax as `search()` |
+| `opts.limit` | `number` | Sessions per page, integer 0–200, default 20 |
+| `opts.offset` | `number` | Sessions to skip, non-negative integer, default 0 |
+| `opts.sources` | `string[]` | Provider IDs (session `source`, missing = `"claude"`); omitted or empty = all |
+| `opts.after` | `string` | ISO lower bound, inclusive, on `COALESCE(ended_at, started_at)` |
+| `opts.cwdPrefixes` | `string[]` | Keep sessions whose first `cwd` equals a prefix or lies under it at a `/` boundary; empty strings are ignored, so `['']` does not filter |
+| `opts.scope` | `'conversation' \| 'all'` | Default `'all'`; `'conversation'` counts only `content_type='text'` rows with role `user` or `assistant` |
+| `opts.sort` | `'relevance' \| 'newest'` | Default `'relevance'`: `score` descending, ties by `updatedAt` descending. `'newest'`: `updatedAt` descending |
+| `opts.snippetChars` | `number` | Snippet window length in characters, positive integer, default 160 |
+| `opts.fallback` | `'or'` | When the primary query matches no session at all, retry safe tokens joined by OR |
+
+Out-of-range or non-integer `limit`, `offset`, `snippetChars`, and unknown
+`scope` / `sort` values throw a `RangeError` naming `searchSessions()` and the
+option.
+
+Returns:
+
+```js
+{
+  sessions: Array<{
+    sessionId, source, nativeSessionId, title, gitBranch, updatedAt,
+    messageCount, cwd, transcriptPath, transcriptIndexed, score,
+    hit: { uuid, role, contentType, timestamp, snippet, highlights }
+  }>,
+  hasMore,     // another page exists after this one
+  generation,  // index generation; 0 when the index has not recorded one
+  degraded     // the primary attempt's degraded marker (see search()), or null
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `source` | Session provider; `"claude"` when unset |
+| `nativeSessionId` | Equals `sessionId` for `claude` sessions, `null` for other providers |
+| `title` | Stored title, else the opening user message (same derivation as `sessions()`); may be `null` |
+| `gitBranch` | `sessions.git_branch` |
+| `updatedAt` | `COALESCE(ended_at, started_at)` |
+| `messageCount` | `sessions.message_count` |
+| `cwd` | The session's earliest non-empty `messages.cwd` by timestamp |
+| `transcriptPath` | `sessions.jsonl_path` |
+| `transcriptIndexed` | `index_state` has a row for `transcriptPath` |
+| `score` | `-rank` of the session's best message; `0` under a LIKE scan, which has no rank |
+| `hit` | The representative message: best-ranked under MATCH, newest under a LIKE scan |
+| `hit.snippet` | Hit-centred window of about `snippetChars` characters (`…` marks a cut edge); the head of the text when no term appears literally |
+| `hit.highlights` | `[start, end)` offsets into `snippet` of every case-insensitive query-term occurrence, sorted, non-overlapping |
+
+`generation` changes when the index is rewritten wholesale (force rebuild,
+tokenizer migration); a host paging with `offset` should restart when it
+changes. `degraded` comes from the primary attempt even when the result is
+empty, unlike `search()`'s per-hit marker.
 
 #### `messages(optsOrUuid)`
 

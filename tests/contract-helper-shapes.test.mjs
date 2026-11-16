@@ -110,6 +110,22 @@ test('search() hit shape matches api-reference.md', () => {
   db.close();
 });
 
+test('searchSessions() shape matches api-reference.md', () => {
+  const db = fixture();
+  const result = createQueryApi(db).searchSessions('needle', { limit: 1 });
+
+  exactKeys(result, ['sessions', 'hasMore', 'generation', 'degraded'], 'searchSessions()');
+  assert.equal(result.sessions.length, 1);
+  assert.equal(typeof result.hasMore, 'boolean');
+  assert.equal(typeof result.generation, 'number');
+  const row = result.sessions[0];
+  exactKeys(row, ['sessionId', 'source', 'nativeSessionId', 'title', 'gitBranch', 'updatedAt', 'messageCount',
+    'cwd', 'transcriptPath', 'transcriptIndexed', 'score', 'hit'], 'searchSessions() session');
+  exactKeys(row.hit, ['uuid', 'role', 'contentType', 'timestamp', 'snippet', 'highlights'], 'searchSessions() session.hit');
+  assert.ok(Array.isArray(row.hit.highlights), 'searchSessions() hit.highlights is an array');
+  db.close();
+});
+
 test('context() shape matches api-reference.md', () => {
   const db = fixture();
   const ctx = createQueryApi(db).context('m-child');
