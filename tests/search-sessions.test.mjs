@@ -141,8 +141,9 @@ test('sources, after, sort and paging', () => {
   addSession(db, { id: 'x2', source: 'codex', startedAt: '2026-05-01T00:00:00.000Z', endedAt: null });
   db.prepare('INSERT INTO index_state (jsonl_path, mtime, lines_processed) VALUES (?, 1, 1)').run('/t/c1.jsonl');
   // c1 is the most relevant (short, repeated term); x1 and x2 tie.
-  addMessage(db, { uuid: 'c1m', sessionId: 'c1', text: 'paging paging paging', timestamp: '2026-01-01T00:10:00.000Z' });
+  // The best-ranked message is inserted last, so first-row-wins would pick c1weak.
   addMessage(db, { uuid: 'c1weak', sessionId: 'c1', text: 'a later and much weaker paging mention among many other words', timestamp: '2026-01-01T00:20:00.000Z' });
+  addMessage(db, { uuid: 'c1m', sessionId: 'c1', text: 'paging paging paging', timestamp: '2026-01-01T00:10:00.000Z' });
   addMessage(db, { uuid: 'x1m', sessionId: 'x1', source: 'codex', text: 'paging once in a much longer sentence with filler words', timestamp: '2026-04-01T00:10:00.000Z' });
   addMessage(db, { uuid: 'x2m', sessionId: 'x2', source: 'codex', text: 'paging once in a much longer sentence with filler words', timestamp: '2026-05-01T00:10:00.000Z' });
   const api = finish(db);
@@ -179,6 +180,63 @@ test('sources, after, sort and paging', () => {
   assert.equal(byId.x2.updatedAt, '2026-05-01T00:00:00.000Z', 'updatedAt falls back to started_at');
   assert.equal(byId.c1.gitBranch, 'main');
   assert.equal(byId.c1.messageCount, 7);
+  db.close();
+});
+
+test('like-scan walks sessions newest first with filters and paging', () => {
+  const db = newDb();
+  const day = (d) => `2026-06-0${d}T00:00:00.000Z`;
+  addSession(db, { id: 'A', startedAt: day(5) });
+  addSession(db, { id: 'B', source: 'codex', startedAt: day(4) });
+  addSession(db, { id: 'B0', startedAt: day(4) });
+  addSession(db, { id: 'C', startedAt: day(3) });
+  addSession(db, { id: 'D', startedAt: day(2) });
+  addSession(db, { id: 'E', startedAt: day(1) });
+  addMessage(db, { uuid: 'a-text', sessionId: 'A', text: '侧栏宽度', timestamp: '2026-06-05T00:01:00.000Z', cwd: '/w/a' });
+  addMessage(db, { uuid: 'a-other', sessionId: 'A', text: '无关', timestamp: '2026-06-05T00:02:00.000Z', cwd: '/w/a' });
+  addMessage(db, { uuid: 'a-tool', sessionId: 'A', contentType: 'tool_result', text: '侧栏输出', timestamp: '2026-06-05T00:03:00.000Z', cwd: '/w/a' });
+  addMessage(db, { uuid: 'b-text', sessionId: 'B', source: 'codex', text: '侧栏', timestamp: '2026-06-04T00:01:00.000Z', cwd: '/w/b' });
+  addMessage(db, { uuid: 'b0-text', sessionId: 'B0', text: '侧栏', timestamp: '2026-06-04T00:01:00.000Z', cwd: '/w/b' });
+  addMessage(db, { uuid: 'c-tool', sessionId: 'C', contentType: 'tool_result', text: '侧栏', timestamp: '2026-06-03T00:01:00.000Z', cwd: '/w/a/sub' });
+  addMessage(db, { uuid: 'd-text', sessionId: 'D', text: '无关内容', timestamp: '2026-06-02T00:01:00.000Z', cwd: '/w/a' });
+  addMessage(db, { uuid: 'e-text', sessionId: 'E', text: '侧栏', timestamp: '2026-06-01T00:01:00.000Z', cwd: '/w/a' });
+  const api = finish(db, { trigram: true });
+
+  const all = api.searchSessions('侧栏');
+  assert.equal(all.degraded, 'like-scan');
+  // Recency, ties on id descending ('B0' > 'B'); scores are all 0.
+  assert.deepEqual(ids(all), ['A', 'B0', 'B', 'C', 'E']);
+  assert.deepEqual(all.sessions.map((s) => s.score), [0, 0, 0, 0, 0]);
+  assert.deepEqual(all.sessions.map((s) => s.hit.uuid), ['a-tool', 'b0-text', 'b-text', 'c-tool', 'e-text']);
+  assert.deepEqual(ids(api.searchSessions('侧栏', { sort: 'newest' })), ['A', 'B0', 'B', 'C', 'E']);
+
+  const conversation = api.searchSessions('侧栏', { scope: 'conversation' });
+  assert.deepEqual(ids(conversation), ['A', 'B0', 'B', 'E']);
+  assert.equal(conversation.sessions[0].hit.uuid, 'a-text', 'representative is the newest match within scope');
+
+  assert.deepEqual(ids(api.searchSessions('侧栏', { cwdPrefixes: ['/w/a'] })), ['A', 'C', 'E']);
+  assert.deepEqual(ids(api.searchSessions('侧栏', { cwdPrefixes: ['/w/a'], scope: 'conversation' })), ['A', 'E']);
+  assert.deepEqual(ids(api.searchSessions('侧栏', { sources: ['codex'] })), ['B']);
+  assert.deepEqual(ids(api.searchSessions('侧栏', { after: day(3) })), ['A', 'B0', 'B', 'C']);
+
+  const pages = [[0, ['A', 'B0'], true], [2, ['B', 'C'], true], [3, ['C', 'E'], false], [4, ['E'], false], [5, [], false]];
+  for (const [offset, expected, more] of pages) {
+    const page = api.searchSessions('侧栏', { limit: 2, offset });
+    assert.deepEqual(ids(page), expected, `offset ${offset}`);
+    assert.equal(page.hasMore, more, `offset ${offset} hasMore`);
+  }
+  db.close();
+});
+
+test('highlights skip FTS5 operators', () => {
+  const db = newDb();
+  addSession(db, { id: 's1', startedAt: '2026-06-01T00:00:00.000Z' });
+  addMessage(db, { uuid: 'm1', sessionId: 's1', text: 'the sidebar is for organizing the panel order', timestamp: '2026-06-01T00:01:00.000Z' });
+  const api = finish(db);
+
+  const [row] = api.searchSessions('sidebar OR panel').sessions;
+  const { snippet, highlights } = row.hit;
+  assert.deepEqual(highlights.map(([start, end]) => snippet.slice(start, end)), ['sidebar', 'panel']);
   db.close();
 });
 

@@ -215,7 +215,7 @@ messages whose session row is missing are skipped.
 | `opts.after` | `string` | ISO lower bound, inclusive, on `COALESCE(ended_at, started_at)` |
 | `opts.cwdPrefixes` | `string[]` | Keep sessions whose first `cwd` equals a prefix or lies under it at a `/` boundary; empty strings are ignored, so `['']` does not filter |
 | `opts.scope` | `'conversation' \| 'all'` | Default `'all'`; `'conversation'` counts only `content_type='text'` rows with role `user` or `assistant` |
-| `opts.sort` | `'relevance' \| 'newest'` | Default `'relevance'`: `score` descending, ties by `updatedAt` descending. `'newest'`: `updatedAt` descending |
+| `opts.sort` | `'relevance' \| 'newest'` | Default `'relevance'`: `score` descending, ties by `updatedAt` descending. `'newest'`: `updatedAt` descending. Remaining ties: `sessionId` descending. Under a LIKE scan every `score` is 0, so both sorts are recency |
 | `opts.snippetChars` | `number` | Snippet window length in characters, positive integer, default 160 |
 | `opts.fallback` | `'or'` | When the primary query matches no session at all, retry safe tokens joined by OR |
 

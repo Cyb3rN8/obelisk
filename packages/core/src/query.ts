@@ -889,35 +889,36 @@ function createQueryApi(
       extraWhere += " AND m.content_type = 'text' AND m.role IN ('user', 'assistant')";
     }
 
-    // Session-level conditions on the grouped rows. A prefix matches the cwd
-    // itself or anything below it at a path-segment boundary.
+    // Session-level cwd condition. A prefix matches the cwd itself or anything
+    // below it at a path-segment boundary. `cwdExpr` is evaluated once per
+    // placeholder group, so callers pass a column or a cheap indexed subquery.
     const firstCwd = (alias: string) => `(SELECT m_c.cwd FROM messages m_c
       WHERE m_c.session_id = ${alias}.id AND m_c.cwd IS NOT NULL AND m_c.cwd <> ''
       ORDER BY m_c.timestamp LIMIT 1)`;
     const prefixes = (cwdPrefixes ?? []).filter((prefix) => typeof prefix === 'string' && prefix !== '');
-    let pageWhere = '1=1';
-    const pageParams: unknown[] = [];
-    if (prefixes.length) {
-      pageWhere = `(${prefixes.map(() => '(c.cwd = ? OR substr(c.cwd, 1, length(?)) = ?)').join(' OR ')})`;
-      for (const prefix of prefixes) {
-        const below = prefix.endsWith('/') ? prefix : `${prefix}/`;
-        pageParams.push(prefix, below, below);
-      }
+    const cwdParams: unknown[] = [];
+    for (const prefix of prefixes) {
+      const below = prefix.endsWith('/') ? prefix : `${prefix}/`;
+      cwdParams.push(prefix, below, below);
     }
+    const cwdWhere = (cwdExpr: string) => (prefixes.length
+      ? `(${prefixes.map(() => `(${cwdExpr} = ? OR substr(${cwdExpr}, 1, length(?)) = ?)`).join(' OR ')})`
+      : '1=1');
 
+    // Ties break on id DESC to match idx_sessions_catalogue_order
+    // (COALESCE(ended_at, started_at) DESC, id DESC), which the like-scan walk
+    // below relies on to stop early.
     const order = sort === 'newest'
-      ? 'updated_at DESC, sid'
-      : 'score DESC, updated_at DESC, sid';
-    const pageSql = (plan: MessageMatchPlan) => {
-      // The bare m.uuid is taken from the row that produced the MIN/MAX
-      // (SQLite's documented bare-column rule): the best-ranked message under
-      // MATCH, the newest under a LIKE scan, which has no rank.
-      const pick = plan.rankExpr === 'NULL'
-        ? 'NULL AS best, MAX(m.timestamp) AS newest'
-        : `MIN(${plan.rankExpr}) AS best`;
-      return `
-        WITH hits AS (
-          SELECT m.session_id AS sid, m.uuid AS hit_uuid, ${pick}
+      ? 'updated_at DESC, sid DESC'
+      : 'score DESC, updated_at DESC, sid DESC';
+
+    // MATCH modes: aggregate the plan's matches by session. The bare m.uuid is
+    // taken from the row that produced the MIN (SQLite's documented bare-column
+    // rule), i.e. the session's best-ranked message.
+    const groupedPage = (plan: MessageMatchPlan) => ({
+      sql: `
+        hits AS (
+          SELECT m.session_id AS sid, m.uuid AS hit_uuid, MIN(${plan.rankExpr}) AS best
           FROM ${plan.from}
           WHERE ${plan.where}${extraWhere}
           GROUP BY m.session_id
@@ -931,10 +932,38 @@ function createQueryApi(
             FROM hits h
             JOIN sessions s ON s.id = h.sid
           ) c
-          WHERE ${pageWhere}
+          WHERE ${cwdWhere('c.cwd')}
           ORDER BY ${order}
           LIMIT ? OFFSET ?
-        )
+        )`,
+      params: [...plan.params, ...extraParams, ...cwdParams],
+    });
+    // LIKE scan: there is no rank, so every score is 0 and both sorts reduce to
+    // recency. Grouping would read every message's text; instead walk sessions
+    // newest first along idx_sessions_catalogue_order and keep one only when the
+    // plan matches inside it, so the scan stops after offset+limit+1 sessions.
+    // The per-session test is the plan's own FROM/WHERE narrowed to the walked
+    // session (ws); the representative is that session's newest match.
+    const walkedPage = (plan: MessageMatchPlan) => {
+      const inSession = `FROM ${plan.from} WHERE ${plan.where}${extraWhere} AND m.session_id = ws.id`;
+      return {
+        sql: `
+        page AS (
+          SELECT ws.id AS sid,
+                 (SELECT m.uuid ${inSession} ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS hit_uuid,
+                 0 AS score,
+                 COALESCE(ws.ended_at, ws.started_at) AS updated_at
+          FROM sessions ws
+          WHERE ${cwdWhere(firstCwd('ws'))}
+            AND EXISTS (SELECT 1 ${inSession})
+          ORDER BY COALESCE(ws.ended_at, ws.started_at) DESC, ws.id DESC
+          LIMIT ? OFFSET ?
+        )`,
+        params: [...plan.params, ...extraParams, ...cwdParams, ...plan.params, ...extraParams],
+      };
+    };
+    const pageSql = (cte: string) => `
+        WITH ${cte}
         SELECT p.sid, p.score, p.updated_at, s.source, s.git_branch, s.message_count, s.jsonl_path,
                ${titleExpr('s')} AS title,
                ${firstCwd('s')} AS cwd,
@@ -945,9 +974,12 @@ function createQueryApi(
         JOIN sessions s ON s.id = p.sid
         JOIN messages hm ON hm.uuid = p.hit_uuid
         ORDER BY ${order}`;
+    const runPage = (pageLimit: number, pageOffset: number) => {
+      return (plan: MessageMatchPlan): DbRow[] => {
+        const page = plan.mode === 'like-scan' ? walkedPage(plan) : groupedPage(plan);
+        return db.prepare(pageSql(page.sql)).all(...page.params, pageLimit, pageOffset);
+      };
     };
-    const runPage = (pageLimit: number, pageOffset: number) => (plan: MessageMatchPlan): DbRow[] =>
-      db.prepare(pageSql(plan)).all(...plan.params, ...extraParams, ...pageParams, pageLimit, pageOffset);
 
     const filters: MatchFilters = {};
     const primary = runFirstWorkingPlan(
@@ -965,7 +997,8 @@ function createQueryApi(
     }
 
     const hasMore = rows.length > limit;
-    const terms = queryTokens(text);
+    // FTS5 operators are syntax, not words the user is looking for.
+    const terms = queryTokens(text).filter((token) => !FTS5_OPERATOR_TOKENS.has(token));
     const before = Math.floor(snippetChars / 3);
     const sessionsOut = rows.slice(0, limit).map((r: DbRow): SessionSearchHit => {
       const source = r.source == null || r.source === '' ? 'claude' : String(r.source);

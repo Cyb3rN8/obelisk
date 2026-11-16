@@ -117,7 +117,7 @@ test('searchSessions() shape matches api-reference.md', () => {
   exactKeys(result, ['sessions', 'hasMore', 'generation', 'degraded'], 'searchSessions()');
   assert.equal(result.sessions.length, 1);
   assert.equal(typeof result.hasMore, 'boolean');
-  assert.equal(typeof result.generation, 'number');
+  assert.ok(Number.isInteger(result.generation) && result.generation >= 0, 'searchSessions() generation is a non-negative integer');
   const row = result.sessions[0];
   exactKeys(row, ['sessionId', 'source', 'nativeSessionId', 'title', 'gitBranch', 'updatedAt', 'messageCount',
     'cwd', 'transcriptPath', 'transcriptIndexed', 'score', 'hit'], 'searchSessions() session');
