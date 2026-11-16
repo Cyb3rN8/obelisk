@@ -962,13 +962,25 @@ function createQueryApi(
     // below it at a path-segment boundary. `cwdExpr` is pasted into the SQL twice
     // per prefix, so SQLite may evaluate it that many times per candidate row:
     // the grouped page passes a column it computed once; the like-scan walk
-    // passes firstCwd(), which is a per-session indexed lookup.
+    // passes firstCwd() itself.
     // A session's cwd is where its main agent started: subagent rows are skipped
-    // and rows without a timestamp sort last.
-    const firstCwd = (alias: string) => `(SELECT m_c.cwd FROM messages m_c
-      WHERE m_c.session_id = ${alias}.id AND m_c.agent_id IS NULL
-        AND m_c.cwd IS NOT NULL AND m_c.cwd <> ''
-      ORDER BY m_c.timestamp IS NULL, m_c.timestamp LIMIT 1)`;
+    // and rows without a timestamp count only when no dated row has a cwd. The
+    // two branches keep this on idx_messages_ts(session_id, timestamp): the first
+    // walks the session's dated rows in timestamp order and stops at the first
+    // qualifying one (skipping only leading subagent or cwd-less rows); the
+    // second runs only when it finds none. A single `ORDER BY timestamp IS NULL,
+    // timestamp` would read the whole session and sort it instead.
+    const firstCwd = (alias: string) => {
+      const qualifying = `m_c.session_id = ${alias}.id AND m_c.agent_id IS NULL
+          AND m_c.cwd IS NOT NULL AND m_c.cwd <> ''`;
+      return `COALESCE(
+        (SELECT m_c.cwd FROM messages m_c
+          WHERE ${qualifying} AND m_c.timestamp IS NOT NULL
+          ORDER BY m_c.timestamp LIMIT 1),
+        (SELECT m_c.cwd FROM messages m_c
+          WHERE ${qualifying} AND m_c.timestamp IS NULL
+          LIMIT 1))`;
+    };
     const prefixes = (cwdPrefixes ?? []).filter((prefix) => typeof prefix === 'string' && prefix !== '');
     const cwdParams: unknown[] = [];
     for (const prefix of prefixes) {
