@@ -40,6 +40,7 @@ import {
 } from '../../../packages/core/src/provider-indexing.ts';
 import { runWriteTransaction, configureConnection, betterSqliteTransactionAdapter } from '../../../packages/core/src/tx.ts';
 import { migrateCoreSchemaColumns, migrateFtsTokenizer, resolveFtsTokenizer } from '../../../packages/core/src/schema-migrations.ts';
+import { ensureIndexGeneration, readIndexGeneration, renewIndexGeneration } from '../../../packages/core/src/index-generation.ts';
 import { acquireWriterLease, writerLockPathFor } from '../../../packages/core/src/writer-lease.ts';
 import { runRetryableWriteTransaction, isBeginBusyFailure, hasUnusableTransaction } from '../../../packages/core/src/write-coordinator.ts';
 import { inferProjectPath } from '../../../packages/core/src/parsing.ts';
@@ -410,6 +411,8 @@ function buildIndex({
         }
       }
       let ftsRebuilt = false;
+      // Force rebuild wipes index_state; the pre-wipe generation floors the renewed one.
+      let previousGeneration = 0;
       const noteCommitted = ({ unit }, nextCursor) => {
         if (nextCursor) {
           latestSourceMtime = Math.max(
@@ -437,6 +440,8 @@ function buildIndex({
         if (messageFtsTriggersDropped) installSchema(db, schemaPath);
         ftsRebuilt = ensureFtsReady(db, { force });
         writeIndexMarker(db, '__last_build__');
+        if (force) renewIndexGeneration(db, previousGeneration);
+        else ensureIndexGeneration(db);
         if (providerResult.complete) writeIndexMarker(db, '__app_last_successful_build__');
         writeIndexMarker(db, '__indexer_owner_app__');
         writeProviderIndexMarkers(db, providerPlan, providerResult);
@@ -458,6 +463,7 @@ function buildIndex({
             ftsRebuilt = false;
             dropMessageFtsTriggers(db);
             messageFtsTriggersDropped = true;
+            previousGeneration = readIndexGeneration(db);
             retainedSnapshot.reset();
             const providerResult = indexProviderPlanStrict({
               db,

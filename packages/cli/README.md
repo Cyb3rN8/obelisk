@@ -21,6 +21,31 @@ obelisk install
 obelisk --query /tmp/query.mjs
 ```
 
+### Host integrations
+
+Two entry points exist for programs that embed Obelisk (design in
+[ADR 0019](../../docs/adr/0019-session-search-cli-for-host-integrations.md)):
+
+```bash
+printf '{"text":"needle","limit":20}' | obelisk --search-sessions --no-refresh
+obelisk --status
+```
+
+`--search-sessions` reads one JSON object from stdin, `{"text": "...", ...opts}`,
+and prints the `searchSessions()` result (`{sessions, hasMore, generation,
+degraded}`; options in the [API reference](../../skill-doc/references/api-reference.md)).
+Invalid JSON, a missing/empty `text`, an unknown key, or a value of the wrong
+type exit 1 with `{error, stack}`.
+
+`--status` prints `{version, searchSessionsProtocol, generation, lastBuildAt,
+tokenizer, sessionsBySource}`. It never builds, migrates, or creates the index;
+with no index it reports generation 0 and `lastBuildAt: null`.
+
+`--no-refresh` (also accepted by `--search`) skips the pre-query refresh and
+reads the committed index read-only, so results can lag transcripts written since
+the last build. With no index it exits 1 naming the missing path. It cannot be
+combined with `--nonce`.
+
 ### Unreadable provider settings
 
 Only a missing settings file (`ENOENT` when read) selects default provider

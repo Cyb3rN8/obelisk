@@ -6,6 +6,7 @@ import { statSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { isAbsolute, normalize, resolve, sep } from 'node:path';
 import { constants as sqliteConstants } from 'node:sqlite';
+import { readIndexGeneration } from './index-generation.ts';
 import { storedSessionCursor } from './provider-indexing.ts';
 import { createBuiltinProviderRegistry } from './providers/builtins.ts';
 import { openCopilotChronicleWithNodeSqlite } from './providers/copilot-node.ts';
@@ -380,6 +381,184 @@ function isTrigramMessagesFts(db: SqliteDb): boolean {
   }
 }
 
+type MatchFilters = Pick<QueryOptions,
+  'sessionId' | 'excludeSession' | 'project' | 'projectPath' | 'after' | 'before'
+  | 'cwd' | 'source' | 'includeMeta' | 'includeInactive'>;
+
+// One way to select matching messages. `from` and `where` use the fixed aliases
+// mf (messages_fts, match modes only), m (messages) and s (sessions); `where`
+// is a bare condition (no WHERE keyword, no ORDER BY / LIMIT) and `params`
+// binds its placeholders in order. A caller adds its own SELECT list, ordering
+// and LIMIT. `none` matches nothing (the query has no usable term): its where
+// is `0`, so running it anyway yields zero rows.
+type MessageMatchPlan = {
+  mode: 'match' | 'match-with-substrings' | 'like-scan' | 'none';
+  from: string;
+  where: string;
+  params: unknown[];
+  // 'rank' for the FTS modes, 'NULL' when there is no relevance order (like-scan, none).
+  rankExpr: string;
+  degraded: string | null;
+};
+
+const MATCH_FROM = 'messages_fts mf JOIN messages m ON m.uuid=mf.uuid LEFT JOIN sessions s ON s.id=m.session_id';
+const SCAN_FROM = 'messages m LEFT JOIN sessions s ON s.id=m.session_id';
+
+// Filters reference m./s. (not mf.) so the same clause serves both the MATCH
+// statement and the LIKE scan; the join makes them equal.
+function buildMessageFilters(filters: MatchFilters): { where: string; params: any[] } {
+  const { sessionId, excludeSession, project, projectPath, after, before, cwd, source,
+    includeMeta = false, includeInactive = false } = filters;
+  let where = '';
+  const params: any[] = [];
+  if (sessionId) { where += ' AND m.session_id=?'; params.push(sessionId); }
+  // Searching history from inside a session almost always hits that session's
+  // own prompt, because the query terms came from it. Excluding in SQL keeps
+  // `limit` spent on other sessions; a post-filter in the script would not.
+  const excluded = typeof excludeSession === 'string' ? [excludeSession] : (excludeSession ?? []);
+  if (excluded.length) {
+    where += ` AND m.session_id NOT IN (${excluded.map(() => '?').join(',')})`;
+    params.push(...excluded);
+  }
+  if (project)   { where += ' AND s.project LIKE ?'; params.push(project); }
+  if (projectPath) { where += ' AND s.project_path=?'; params.push(projectPath); }
+  if (after)     { where += ' AND m.timestamp>?';    params.push(after); }
+  if (before)    { where += ' AND m.timestamp<?';    params.push(before); }
+  if (cwd)       { where += ' AND m.cwd LIKE ?';     params.push(cwd); }
+  if (source && source !== 'all') { where += " AND COALESCE(m.source, s.source, 'claude')=?"; params.push(source); }
+  if (!includeMeta) where += ' AND COALESCE(m.is_meta,0)=0';
+  where += ` AND ${visibilitySql('m', includeInactive)}`;
+  return { where, params };
+}
+
+// Builds the candidate statements for matching `text` against messages, in the
+// order they must be tried: a caller runs them through runFirstWorkingPlan, and
+// the first one that does not throw wins. Nothing is executed here.
+//   'primary'     the query itself. Under a plain trigram query that is one
+//                 guarded plan; otherwise raw FTS5 syntax is honored first,
+//                 then safe per-token quoting if FTS5 rejects the raw text.
+//   'or-fallback' the broadened any-term query for callers whose primary
+//                 attempt found nothing (`fallback: 'or'`).
+function planMessageMatch(
+  db: SqliteDb,
+  text: string,
+  filters: MatchFilters,
+  attempt: 'primary' | 'or-fallback',
+): MessageMatchPlan[] {
+  const { where: filterWhere, params: filterParams } = buildMessageFilters(filters);
+  const trigram = isTrigramMessagesFts(db);
+
+  const none = (): MessageMatchPlan => ({
+    mode: 'none', from: SCAN_FROM, where: '0', params: [], rankExpr: 'NULL', degraded: null,
+  });
+  const matchPlan = (matchText: string, degraded: string | null = null): MessageMatchPlan => ({
+    mode: 'match',
+    from: MATCH_FROM,
+    where: `mf.text MATCH ?${filterWhere}`,
+    params: [matchText, ...filterParams],
+    rankExpr: 'rank',
+    degraded,
+  });
+  // Terms below the trigram minimum cannot go through MATCH; scan the
+  // content table instead. Tokens are alphanumeric-only, so no LIKE escaping
+  // is needed. rank is NULL — recency stands in for relevance here.
+  const likeScanPlan = (terms: string[], degraded: string | null): MessageMatchPlan => ({
+    mode: 'like-scan',
+    from: SCAN_FROM,
+    where: `${terms.map(() => 'm.text LIKE ?').join(' AND ')}${filterWhere}`,
+    params: [...terms.map((t) => `%${t}%`), ...filterParams],
+    rankExpr: 'NULL',
+    degraded,
+  });
+  // MATCH the indexable terms with the short ones pushed down as SQL LIKE
+  // substring conditions: the filter runs over the full MATCH result set
+  // before LIMIT, so recall does not depend on where the combined hits rank.
+  // (A JS post-filter over an overselected window returned zero rows on a
+  // real index whose top bm25 hits for the long term lacked the short one.)
+  const substringsPlan = (matchText: string, terms: string[], degraded: string | null): MessageMatchPlan => ({
+    mode: 'match-with-substrings',
+    from: MATCH_FROM,
+    where: `mf.text MATCH ?${terms.map(() => ' AND m.text LIKE ?').join('')}${filterWhere}`,
+    params: [matchText, ...terms.map((t) => `%${t}%`), ...filterParams],
+    rankExpr: 'rank',
+    degraded,
+  });
+  // Under trigram, terms shorter than three code points silently constrain
+  // nothing (false positives next to longer terms, zero hits alone). Split
+  // the tokens: MATCH the indexable ones, then require the short ones as
+  // literal substrings; with nothing indexable, fall back to a LIKE scan.
+  const tokensGuardedPlan = (tokens: string[]): MessageMatchPlan => {
+    const unique = [...new Set(tokens)];
+    const short = unique.filter((token) => [...token].length < 3);
+    const long = unique.filter((token) => [...token].length >= 3);
+    const matchText = long.slice(0, 12).map((token) => `"${token}"`).join(' ');
+    if (short.length === 0) return matchText ? matchPlan(matchText) : none();
+    if (long.length === 0) return likeScanPlan(short, 'like-scan');
+    return substringsPlan(matchText, short, 'short-token-post-filter');
+  };
+
+  if (attempt === 'or-fallback') {
+    // Under trigram a sub-3-codepoint OR term matches nothing, so drop it rather than send it.
+    const orTokens = queryTokens(text).filter((token) => !trigram || [...token].length >= 3);
+    const broad = buildSafeFtsQuery(orTokens.join(' '), ' OR ');
+    return [broad ? matchPlan(broad) : none()];
+  }
+
+  if (trigram && isPlainQuery(text)) return [tokensGuardedPlan(queryTokens(text))];
+
+  // FTS5 drops sub-3-codepoint terms from raw syntax exactly as it does
+  // from a plain query, and it does not fail on them, so this path used to
+  // return the silent false positives the guard exists to remove:
+  // search('"quick" ok') answered with rows that never contained 'ok'.
+  // Requiring the short terms as substrings restores the constraint, but
+  // only where it means the same thing — with OR / NOT / NEAR present an
+  // added AND would answer a different question, and with no indexable
+  // term there is nothing to intersect with. Those two are reported
+  // instead of rewritten, so a caller that gets no help still knows it.
+  const rawTerms = [...new Set(queryTokens(text))].filter((token) => !FTS5_OPERATOR_TOKENS.has(token));
+  const rawShort = rawTerms.filter((token) => [...token].length < 3);
+  const enforceable = trigram && rawShort.length > 0
+    && rawTerms.some((token) => [...token].length >= 3)
+    && !FTS5_DISJUNCTION.test(text);
+  const raw = enforceable
+    ? substringsPlan(text, rawShort, 'short-token-post-filter')
+    : matchPlan(text, trigram && rawShort.length > 0 ? 'short-token-unguarded' : null);
+  // Honor raw FTS5 syntax when the query is valid, but never crash on
+  // ordinary input (hyphens, punctuation) that FTS5 would parse as
+  // operators: fall back to safe per-token quoting — routed through the
+  // same short-token guard under trigram, since the extracted tokens can
+  // be short too ('gen-itgc ok').
+  let safe: MessageMatchPlan;
+  if (trigram) {
+    safe = tokensGuardedPlan(queryTokens(text));
+  } else {
+    const safeText = buildSafeFtsQuery(text);
+    safe = safeText ? matchPlan(safeText) : none();
+  }
+  return [raw, safe];
+}
+
+// Runs plans in order and returns the first whose `run` does not throw, along
+// with its value. A `none` plan is not run; it yields `empty`. The last plan's
+// error propagates, so only a failure that has a fallback behind it is absorbed.
+function runFirstWorkingPlan<T>(
+  plans: MessageMatchPlan[],
+  run: (plan: MessageMatchPlan) => T,
+  empty: T,
+): { plan: MessageMatchPlan; value: T } {
+  for (let i = 0; i < plans.length; i++) {
+    const plan = plans[i];
+    if (plan.mode === 'none') return { plan, value: empty };
+    if (i === plans.length - 1) return { plan, value: run(plan) };
+    try {
+      return { plan, value: run(plan) };
+    } catch {
+      // fall through to the next candidate
+    }
+  }
+  throw new Error('runFirstWorkingPlan requires at least one plan');
+}
+
 const SNIPPET_BEFORE = 60;
 const SNIPPET_AFTER = 100;
 
@@ -408,6 +587,117 @@ function makeSnippet(
   if (start > 0 && (text.charCodeAt(start) & 0xFC00) === 0xDC00) start--;
   if (end < text.length && (text.charCodeAt(end) & 0xFC00) === 0xDC00) end++;
   return (start > 0 ? '…' : '') + text.slice(start, end) + (end < text.length ? '…' : '');
+}
+
+// Fallback when no query term appears literally in the hit (e.g. FTS5 syntax):
+// the head of the text, with '…' marking the cut edge as makeSnippet does.
+function headSnippet(text: string, chars: number): string {
+  if (text.length <= chars) return text;
+  let end = chars;
+  if ((text.charCodeAt(end) & 0xFC00) === 0xDC00) end++;
+  return end < text.length ? `${text.slice(0, end)}…` : text;
+}
+
+// Runs `read` inside one read transaction so every statement sees the same
+// snapshot. A caller already in a transaction has pinned a snapshot itself, so
+// `read` just runs in it. A failed statement inside `read` (the FTS5 syntax
+// errors runFirstWorkingPlan absorbs) does not end the transaction, so plan
+// fallback still reads the same snapshot. The transaction is always closed; a
+// close failure never masks an error from `read`.
+function inReadSnapshot<T>(db: SqliteDb, read: () => T): T {
+  const handle = db as unknown as { isTransaction?: unknown; inTransaction?: unknown };
+  const active = (): boolean | null => {
+    if (typeof handle.isTransaction === 'boolean') return handle.isTransaction;
+    if (typeof handle.inTransaction === 'boolean') return handle.inTransaction;
+    return null;
+  };
+  if (active() === true) return read();
+  const close = () => {
+    if (active() !== false) db.exec('ROLLBACK');
+  };
+  db.exec('BEGIN');
+  let value: T;
+  try {
+    value = read();
+  } catch (error) {
+    try {
+      close();
+    } catch {
+      // the read error is the one worth reporting
+    }
+    throw error;
+  }
+  close();
+  return value;
+}
+
+interface SearchSessionsOptions {
+  limit?: number;
+  offset?: number;
+  sources?: string[];
+  after?: string;
+  cwdPrefixes?: string[];
+  scope?: 'conversation' | 'all';
+  sort?: 'relevance' | 'newest';
+  snippetChars?: number;
+  fallback?: 'or';
+}
+
+const SEARCH_SESSIONS_OPTION_KEYS: ReadonlySet<string> = new Set([
+  'limit', 'offset', 'sources', 'after', 'cwdPrefixes', 'scope', 'sort', 'snippetChars', 'fallback',
+]);
+
+interface SessionSearchHit {
+  sessionId: string;
+  source: string;
+  nativeSessionId: string | null;
+  title: string | null;
+  gitBranch: string | null;
+  updatedAt: string | null;
+  messageCount: number;
+  cwd: string | null;
+  transcriptPath: string | null;
+  transcriptIndexed: boolean;
+  score: number;
+  hit: {
+    uuid: string;
+    role: string;
+    contentType: string | null;
+    timestamp: string | null;
+    agentId: string | null;
+    snippet: string;
+    highlights: Array<[number, number]>;
+  };
+}
+
+interface SearchSessionsResult {
+  sessions: SessionSearchHit[];
+  hasMore: boolean;
+  generation: number;
+  degraded: string | null;
+}
+
+// Every case-insensitive occurrence of a query term in `text`, sorted by start.
+// Overlapping ranges (one term inside another) are merged so the result never
+// overlaps; adjacent ranges stay separate. A regex on the original string keeps
+// the offsets right where lowercasing would change the string's length.
+function highlightRanges(text: string, terms: string[]): Array<[number, number]> {
+  const ranges: Array<[number, number]> = [];
+  for (const term of new Set(terms)) {
+    if (!term) continue;
+    const re = new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'giu');
+    for (const match of text.matchAll(re)) {
+      ranges.push([match.index, match.index + match[0].length]);
+    }
+  }
+  ranges.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const merged: Array<[number, number]> = [];
+  for (const range of ranges) {
+    const last = merged[merged.length - 1];
+    if (last && range[0] < last[1]) last[1] = Math.max(last[1], range[1]);
+    else merged.push([range[0], range[1]]);
+  }
+  return merged;
 }
 
 function createQueryApi(
@@ -459,27 +749,6 @@ function createQueryApi(
     if (snippetTokens !== undefined && (!Number.isInteger(snippetTokens) || snippetTokens < 1 || snippetTokens > 64)) {
       throw new RangeError('search() snippetTokens must be an integer from 1 to 64');
     }
-    // Filters reference m./s. (not mf.) so the same clause serves both the
-    // MATCH statement and the LIKE fallback scan; the join makes them equal.
-    let filterWhere = '';
-    const filterParams: any[] = [];
-    if (sessionId) { filterWhere += ' AND m.session_id=?'; filterParams.push(sessionId); }
-    // Searching history from inside a session almost always hits that session's
-    // own prompt, because the query terms came from it. Excluding in SQL keeps
-    // `limit` spent on other sessions; a post-filter in the script would not.
-    const excluded = typeof excludeSession === 'string' ? [excludeSession] : (excludeSession ?? []);
-    if (excluded.length) {
-      filterWhere += ` AND m.session_id NOT IN (${excluded.map(() => '?').join(',')})`;
-      filterParams.push(...excluded);
-    }
-    if (project)   { filterWhere += ' AND s.project LIKE ?'; filterParams.push(project); }
-    if (projectPath) { filterWhere += ' AND s.project_path=?'; filterParams.push(projectPath); }
-    if (after)     { filterWhere += ' AND m.timestamp>?';    filterParams.push(after); }
-    if (before)    { filterWhere += ' AND m.timestamp<?';    filterParams.push(before); }
-    if (cwd)       { filterWhere += ' AND m.cwd LIKE ?';     filterParams.push(cwd); }
-    if (source && source !== 'all') { filterWhere += " AND COALESCE(m.source, s.source, 'claude')=?"; filterParams.push(source); }
-    if (!includeMeta) filterWhere += ' AND COALESCE(m.is_meta,0)=0';
-    filterWhere += ` AND ${visibilitySql('m', includeInactive)}`;
     const trigram = isTrigramMessagesFts(db);
     // snippet() only exists under MATCH, and under trigram it counts 3-character
     // grams, so 16 "tokens" is about 18 characters. LOCAL: both the LIKE scan and
@@ -499,99 +768,24 @@ function createQueryApi(
              COALESCE(m.visibility,'visible') AS visibility,m.source as m_source,
              s.id as s_id,${titleExpr('s')} as s_title,s.project as s_project,s.started_at as s_started,
              s.source as s_source`;
-    const stmt = db.prepare(`${selectCols()},
-             rank
-      FROM messages_fts mf JOIN messages m ON m.uuid=mf.uuid LEFT JOIN sessions s ON s.id=m.session_id
-      WHERE mf.text MATCH ?${filterWhere} ORDER BY rank LIMIT ?`);
-    const runMatch = (matchText: string, rowLimit: number = limit): DbRow[] =>
-      stmt.all(matchText, ...filterParams, rowLimit);
-
-    // Terms below the trigram minimum cannot go through MATCH; scan the
-    // content table instead. Tokens are alphanumeric-only, so no LIKE escaping
-    // is needed. rank is NULL — recency stands in for relevance here.
-    const runLikeScan = (terms: string[]): DbRow[] => {
-      const likeWhere = terms.map(() => 'm.text LIKE ?').join(' AND ');
-      const likeStmt = db.prepare(`${selectCols(false)},
-             NULL as rank
-      FROM messages m LEFT JOIN sessions s ON s.id=m.session_id
-      WHERE ${likeWhere}${filterWhere} ORDER BY m.timestamp DESC LIMIT ?`);
-      return likeStmt.all(...terms.map((t) => `%${t}%`), ...filterParams, limit);
+    const filters: MatchFilters = {
+      sessionId, excludeSession, project, projectPath, after, before, cwd, source, includeMeta, includeInactive,
     };
-
-    // MATCH the indexable terms with the short ones pushed down as SQL LIKE
-    // substring conditions: the filter runs over the full MATCH result set
-    // before LIMIT, so recall does not depend on where the combined hits rank.
-    // (A JS post-filter over an overselected window returned zero rows on a
-    // real index whose top bm25 hits for the long term lacked the short one.)
-    const runMatchWithSubstrings = (matchText: string, terms: string[]): DbRow[] => {
-      const likeAnd = terms.map(() => ' AND m.text LIKE ?').join('');
-      const guarded = db.prepare(`${selectCols()},
-             rank
-      FROM messages_fts mf JOIN messages m ON m.uuid=mf.uuid LEFT JOIN sessions s ON s.id=m.session_id
-      WHERE mf.text MATCH ?${likeAnd}${filterWhere} ORDER BY rank LIMIT ?`);
-      return guarded.all(matchText, ...terms.map((t) => `%${t}%`), ...filterParams, limit);
+    // The plan owns FROM/WHERE/params/rank; this statement only adds the
+    // columns the result assembly below needs, plus ordering and LIMIT.
+    const runPlan = (plan: MessageMatchPlan): DbRow[] => {
+      const rankSelect = plan.rankExpr === 'rank' ? 'rank' : `${plan.rankExpr} as rank`;
+      const orderBy = plan.mode === 'like-scan' ? 'm.timestamp DESC' : 'rank';
+      return db.prepare(`${selectCols(plan.mode !== 'like-scan')},
+             ${rankSelect}
+      FROM ${plan.from}
+      WHERE ${plan.where} ORDER BY ${orderBy} LIMIT ?`).all(...plan.params, limit);
     };
-
-    // Under trigram, terms shorter than three code points silently constrain
-    // nothing (false positives next to longer terms, zero hits alone). Split
-    // the tokens: MATCH the indexable ones, then require the short ones as
-    // literal substrings; with nothing indexable, fall back to a LIKE scan.
-    const runTokensGuarded = (tokens: string[]): { rows: DbRow[]; degraded: string | null } => {
-      const unique = [...new Set(tokens)];
-      const short = unique.filter((token) => [...token].length < 3);
-      const long = unique.filter((token) => [...token].length >= 3);
-      const matchText = long.slice(0, 12).map((token) => `"${token}"`).join(' ');
-      if (short.length === 0) return { rows: matchText ? runMatch(matchText) : [], degraded: null };
-      if (long.length === 0) return { rows: runLikeScan(short), degraded: 'like-scan' };
-      return { rows: runMatchWithSubstrings(matchText, short), degraded: 'short-token-post-filter' };
-    };
-
-    let rows: DbRow[];
-    let degraded: string | null = null;
-    if (trigram && isPlainQuery(text)) {
-      ({ rows, degraded } = runTokensGuarded(queryTokens(text)));
-    } else {
-      // FTS5 drops sub-3-codepoint terms from raw syntax exactly as it does
-      // from a plain query, and it does not fail on them, so this path used to
-      // return the silent false positives the guard exists to remove:
-      // search('"quick" ok') answered with rows that never contained 'ok'.
-      // Requiring the short terms as substrings restores the constraint, but
-      // only where it means the same thing — with OR / NOT / NEAR present an
-      // added AND would answer a different question, and with no indexable
-      // term there is nothing to intersect with. Those two are reported
-      // instead of rewritten, so a caller that gets no help still knows it.
-      const rawTerms = [...new Set(queryTokens(text))].filter((token) => !FTS5_OPERATOR_TOKENS.has(token));
-      const rawShort = rawTerms.filter((token) => [...token].length < 3);
-      const enforceable = trigram && rawShort.length > 0
-        && rawTerms.some((token) => [...token].length >= 3)
-        && !FTS5_DISJUNCTION.test(text);
-      // Honor raw FTS5 syntax when the query is valid, but never crash on
-      // ordinary input (hyphens, punctuation) that FTS5 would parse as
-      // operators: fall back to safe per-token quoting — routed through the
-      // same short-token guard under trigram, since the extracted tokens can
-      // be short too ('gen-itgc ok').
-      try {
-        if (enforceable) {
-          rows = runMatchWithSubstrings(text, rawShort);
-          degraded = 'short-token-post-filter';
-        } else {
-          rows = runMatch(text);
-          if (trigram && rawShort.length > 0) degraded = 'short-token-unguarded';
-        }
-      } catch {
-        if (trigram) {
-          ({ rows, degraded } = runTokensGuarded(queryTokens(text)));
-        } else {
-          const safe = buildSafeFtsQuery(text);
-          rows = safe ? runMatch(safe) : [];
-        }
-      }
-    }
+    const primary = runFirstWorkingPlan(planMessageMatch(db, text, filters, 'primary'), runPlan, [] as DbRow[]);
+    let rows = primary.value;
+    const degraded = primary.plan.degraded;
     if (rows.length === 0 && fallback === 'or') {
-      // Under trigram a sub-3-codepoint OR term matches nothing, so drop it rather than send it.
-      const orTokens = queryTokens(text).filter((token) => !trigram || [...token].length >= 3);
-      const broad = buildSafeFtsQuery(orTokens.join(' '), ' OR ');
-      rows = broad ? runMatch(broad) : [];
+      rows = runFirstWorkingPlan(planMessageMatch(db, text, filters, 'or-fallback'), runPlan, [] as DbRow[]).value;
     }
     const snippetTerms = queryTokens(text);
     if (!sqlSnippet) rows = trimToSnippet(rows, snippetTerms);
@@ -692,6 +886,245 @@ function createQueryApi(
       if (degraded) result.degraded = degraded;
       return result;
     });
+  };
+
+  // One row per session, matched exactly as search() matches messages: the same
+  // planMessageMatch plans run through runFirstWorkingPlan, with the plan's
+  // matches grouped by session before ordering and paging, so a session with
+  // hundreds of hits takes one row. Session-level filters are appended to the
+  // plan's WHERE; they narrow which messages count, never how text matches.
+  const searchSessions = (text: string, opts: SearchSessionsOptions = {}): SearchSessionsResult => {
+    // Strict like messages(): a host sends these keys over the CLI as JSON, so an
+    // unknown key or a wrong type is a caller bug to report, never a silent no-op.
+    // A new key bumps SEARCH_SESSIONS_PROTOCOL; older versions reject it here.
+    if (opts === null || typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new TypeError(`searchSessions() options must be an object (got ${JSON.stringify(opts)})`);
+    }
+    for (const key of Object.keys(opts)) {
+      if (!SEARCH_SESSIONS_OPTION_KEYS.has(key)) {
+        throw new TypeError(`searchSessions() does not accept option "${key}"; accepted options: ${[...SEARCH_SESSIONS_OPTION_KEYS].join(', ')}`);
+      }
+    }
+    const shown = (value: unknown) => JSON.stringify(value) ?? String(value);
+    const integerOption = (key: 'limit' | 'offset' | 'snippetChars', fallbackValue: number, min: number, max: number | null, rule: string) => {
+      const value: unknown = opts[key];
+      if (value === undefined) return fallbackValue;
+      if (typeof value !== 'number') throw new TypeError(`searchSessions() ${key} must be ${rule} (got ${shown(value)})`);
+      if (!Number.isInteger(value) || value < min || (max !== null && value > max)) {
+        throw new RangeError(`searchSessions() ${key} must be ${rule} (got ${shown(value)})`);
+      }
+      return value;
+    };
+    const stringArrayOption = (key: 'sources' | 'cwdPrefixes'): string[] | undefined => {
+      const value: unknown = opts[key];
+      if (value === undefined) return undefined;
+      if (!Array.isArray(value) || value.some((item) => typeof item !== 'string')) {
+        throw new TypeError(`searchSessions() ${key} must be an array of strings (got ${shown(value)})`);
+      }
+      return value as string[];
+    };
+    const limit = integerOption('limit', 20, 0, 200, 'an integer from 0 to 200');
+    const offset = integerOption('offset', 0, 0, null, 'a non-negative integer');
+    const snippetChars = integerOption('snippetChars', 160, 1, null, 'a positive integer');
+    const sources = stringArrayOption('sources');
+    const cwdPrefixes = stringArrayOption('cwdPrefixes');
+    const { after, scope = 'all', sort = 'relevance', fallback } = opts;
+    if (after !== undefined && typeof after !== 'string') {
+      throw new TypeError(`searchSessions() after must be an ISO timestamp string (got ${shown(after)})`);
+    }
+    if (scope !== 'all' && scope !== 'conversation') {
+      throw new RangeError(`searchSessions() scope must be 'conversation' or 'all' (got ${shown(scope)})`);
+    }
+    if (sort !== 'relevance' && sort !== 'newest') {
+      throw new RangeError(`searchSessions() sort must be 'relevance' or 'newest' (got ${shown(sort)})`);
+    }
+    if (fallback !== undefined && fallback !== 'or') {
+      throw new RangeError(`searchSessions() fallback must be 'or' when given (got ${shown(fallback)})`);
+    }
+
+    // Message-level conditions, appended to the plan's bare WHERE.
+    let extraWhere = ' AND s.id IS NOT NULL';
+    const extraParams: unknown[] = [];
+    if (sources?.length) {
+      extraWhere += ` AND COALESCE(s.source, 'claude') IN (${sources.map(() => '?').join(',')})`;
+      extraParams.push(...sources);
+    }
+    if (after) {
+      extraWhere += ' AND COALESCE(s.ended_at, s.started_at) >= ?';
+      extraParams.push(after);
+    }
+    if (scope === 'conversation') {
+      // Subagent transcripts are not the conversation the user had; 'all' keeps them.
+      extraWhere += " AND m.content_type = 'text' AND m.role IN ('user', 'assistant') AND m.agent_id IS NULL";
+    }
+
+    // Session-level cwd condition. A prefix matches the cwd itself or anything
+    // below it at a path-segment boundary. `cwdExpr` is pasted into the SQL twice
+    // per prefix, so SQLite may evaluate it that many times per candidate row:
+    // the grouped page passes a column it computed once; the like-scan walk
+    // passes firstCwd() itself.
+    // A session's cwd is where its main agent started: subagent rows are skipped
+    // and rows without a timestamp count only when no dated row has a cwd. The
+    // two branches keep this on idx_messages_ts(session_id, timestamp): the first
+    // walks the session's dated rows in timestamp order and stops at the first
+    // qualifying one (skipping only leading subagent or cwd-less rows); the
+    // second runs only when it finds none. A single `ORDER BY timestamp IS NULL,
+    // timestamp` would read the whole session and sort it instead.
+    const firstCwd = (alias: string) => {
+      const qualifying = `m_c.session_id = ${alias}.id AND m_c.agent_id IS NULL
+          AND m_c.cwd IS NOT NULL AND m_c.cwd <> ''`;
+      return `COALESCE(
+        (SELECT m_c.cwd FROM messages m_c
+          WHERE ${qualifying} AND m_c.timestamp IS NOT NULL
+          ORDER BY m_c.timestamp LIMIT 1),
+        (SELECT m_c.cwd FROM messages m_c
+          WHERE ${qualifying} AND m_c.timestamp IS NULL
+          LIMIT 1))`;
+    };
+    const prefixes = (cwdPrefixes ?? []).filter((prefix) => typeof prefix === 'string' && prefix !== '');
+    const cwdParams: unknown[] = [];
+    for (const prefix of prefixes) {
+      const below = prefix.endsWith('/') ? prefix : `${prefix}/`;
+      cwdParams.push(prefix, below, below);
+    }
+    const cwdWhere = (cwdExpr: string) => (prefixes.length
+      ? `(${prefixes.map(() => `(${cwdExpr} = ? OR substr(${cwdExpr}, 1, length(?)) = ?)`).join(' OR ')})`
+      : '1=1');
+
+    // Ties break on id DESC to match idx_sessions_catalogue_order
+    // (COALESCE(ended_at, started_at) DESC, id DESC), which the like-scan walk
+    // below relies on to stop early.
+    const order = sort === 'newest'
+      ? 'updated_at DESC, sid DESC'
+      : 'score DESC, updated_at DESC, sid DESC';
+
+    // MATCH modes: aggregate the plan's matches by session. The bare m.uuid is
+    // taken from the row that produced the MIN (SQLite's documented bare-column
+    // rule), i.e. the session's best-ranked message.
+    const groupedPage = (plan: MessageMatchPlan) => ({
+      sql: `
+        hits AS (
+          SELECT m.session_id AS sid, m.uuid AS hit_uuid, MIN(${plan.rankExpr}) AS best
+          FROM ${plan.from}
+          WHERE ${plan.where}${extraWhere}
+          GROUP BY m.session_id
+        ),
+        page AS (
+          SELECT c.sid, c.hit_uuid, c.score, c.updated_at
+          FROM (
+            SELECT h.sid, h.hit_uuid, COALESCE(-h.best, 0) AS score,
+                   COALESCE(s.ended_at, s.started_at) AS updated_at
+                   ${prefixes.length ? `, ${firstCwd('s')} AS cwd` : ''}
+            FROM hits h
+            JOIN sessions s ON s.id = h.sid
+          ) c
+          WHERE ${cwdWhere('c.cwd')}
+          ORDER BY ${order}
+          LIMIT ? OFFSET ?
+        )`,
+      params: [...plan.params, ...extraParams, ...cwdParams],
+    });
+    // LIKE scan: there is no rank, so every score is 0 and both sorts reduce to
+    // recency. Grouping would read every message's text; instead walk sessions
+    // newest first along idx_sessions_catalogue_order and keep one only when the
+    // plan matches inside it, so the scan stops after offset+limit+1 sessions.
+    // The per-session test is the plan's own FROM/WHERE narrowed to the walked
+    // session (ws); the representative is that session's newest match.
+    const walkedPage = (plan: MessageMatchPlan) => {
+      const inSession = `FROM ${plan.from} WHERE ${plan.where}${extraWhere} AND m.session_id = ws.id`;
+      return {
+        sql: `
+        page AS (
+          SELECT ws.id AS sid,
+                 (SELECT m.uuid ${inSession} ORDER BY m.timestamp DESC, m.rowid DESC LIMIT 1) AS hit_uuid,
+                 0 AS score,
+                 COALESCE(ws.ended_at, ws.started_at) AS updated_at
+          FROM sessions ws
+          WHERE ${cwdWhere(firstCwd('ws'))}
+            AND EXISTS (SELECT 1 ${inSession})
+          ORDER BY COALESCE(ws.ended_at, ws.started_at) DESC, ws.id DESC
+          LIMIT ? OFFSET ?
+        )`,
+        params: [...plan.params, ...extraParams, ...cwdParams, ...plan.params, ...extraParams],
+      };
+    };
+    const pageSql = (cte: string) => `
+        WITH ${cte}
+        SELECT p.sid, p.score, p.updated_at, s.source, s.git_branch, s.message_count, s.jsonl_path,
+               ${titleExpr('s')} AS title,
+               ${firstCwd('s')} AS cwd,
+               EXISTS (SELECT 1 FROM index_state i WHERE i.jsonl_path = s.jsonl_path) AS transcript_indexed,
+               hm.uuid AS hit_uuid, hm.role AS hit_role, hm.content_type AS hit_content_type,
+               hm.timestamp AS hit_timestamp, hm.text AS hit_text, hm.agent_id AS hit_agent_id
+        FROM page p
+        JOIN sessions s ON s.id = p.sid
+        JOIN messages hm ON hm.uuid = p.hit_uuid
+        ORDER BY ${order}`;
+    const runPage = (pageLimit: number, pageOffset: number) => {
+      return (plan: MessageMatchPlan): DbRow[] => {
+        const page = plan.mode === 'like-scan' ? walkedPage(plan) : groupedPage(plan);
+        return db.prepare(pageSql(page.sql)).all(...page.params, pageLimit, pageOffset);
+      };
+    };
+
+    // The page, the fallback probe and the generation are read in one snapshot,
+    // so a rebuild committing between them cannot pair an old page with the new
+    // generation (a host would then page on into rewritten content).
+    const filters: MatchFilters = {};
+    const { primary, rows, generation } = inReadSnapshot(db, () => {
+      const primary = runFirstWorkingPlan(
+        planMessageMatch(db, text, filters, 'primary'), runPage(limit + 1, offset), [] as DbRow[]);
+      let rows = primary.value;
+      if (fallback === 'or' && rows.length === 0) {
+        // Same rule as search(): broaden only when the primary query matched no
+        // session at all. An empty page past the end of a real result is not that.
+        const primaryEmpty = offset === 0 || primary.plan.mode === 'none'
+          || runPage(1, 0)(primary.plan).length === 0;
+        if (primaryEmpty) {
+          rows = runFirstWorkingPlan(
+            planMessageMatch(db, text, filters, 'or-fallback'), runPage(limit + 1, offset), [] as DbRow[]).value;
+        }
+      }
+      return { primary, rows, generation: readIndexGeneration(db) };
+    });
+
+    const hasMore = rows.length > limit;
+    // FTS5 operators are syntax, not words the user is looking for.
+    const terms = queryTokens(text).filter((token) => !FTS5_OPERATOR_TOKENS.has(token));
+    const before = Math.floor(snippetChars / 3);
+    const sessionsOut = rows.slice(0, limit).map((r: DbRow): SessionSearchHit => {
+      const source = r.source == null || r.source === '' ? 'claude' : String(r.source);
+      const hitText = String(r.hit_text ?? '');
+      const snippet = makeSnippet(hitText, terms, before, snippetChars - before) ?? headSnippet(hitText, snippetChars);
+      return {
+        sessionId: String(r.sid),
+        source,
+        nativeSessionId: source === 'claude' ? String(r.sid) : null,
+        title: r.title == null ? null : String(r.title),
+        gitBranch: r.git_branch == null ? null : String(r.git_branch),
+        updatedAt: r.updated_at == null ? null : String(r.updated_at),
+        messageCount: Number(r.message_count ?? 0),
+        cwd: r.cwd == null ? null : String(r.cwd),
+        transcriptPath: r.jsonl_path == null ? null : String(r.jsonl_path),
+        transcriptIndexed: Boolean(r.transcript_indexed),
+        score: Number(r.score),
+        hit: {
+          uuid: String(r.hit_uuid),
+          role: String(r.hit_role ?? ''),
+          contentType: r.hit_content_type == null ? null : String(r.hit_content_type),
+          timestamp: r.hit_timestamp == null ? null : String(r.hit_timestamp),
+          agentId: r.hit_agent_id == null ? null : String(r.hit_agent_id),
+          snippet,
+          highlights: highlightRanges(snippet, terms),
+        },
+      };
+    });
+    return {
+      sessions: sessionsOut,
+      hasMore,
+      generation,
+      degraded: primary.plan.degraded,
+    };
   };
 
   const messages = (input: MessageQueryOptions | string) => {
@@ -1269,7 +1702,7 @@ function createQueryApi(
     `).all(...params);
   };
 
-  return { sql: q, search, messages, context, trace, thread, subagents, workflows, workflowTree, fileHistory, failures, sessions, recent, summaries, raw, memories, overview };
+  return { sql: q, search, searchSessions, messages, context, trace, thread, subagents, workflows, workflowTree, fileHistory, failures, sessions, recent, summaries, raw, memories, overview };
 }
 
 function createAttuneApi(db: SqliteDb, runMutation: <T>(work: () => T) => T = (work) => work()) {

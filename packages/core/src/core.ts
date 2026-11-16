@@ -4,18 +4,21 @@
 // Obelisk Core package (see docs/adr/0003-core-typescript-esm-precompiled.md).
 //
 // The single shared implementation behind every transport. The CLI and later
-// the MCP server are thin shells over these four functions;
+// the MCP server are thin shells over the exported entry points (buildIndex,
+// searchText, searchSessionsText, indexStatus, executeQuery, executeAttune);
 // none of them re-implement retrieval or own the DB lifecycle.
 //
 // Authored in TypeScript with erasable-only syntax so Node can run it directly
 // via type stripping in development, while the CLI package ships readable,
 // non-bundled tsc output. Core source lives in the @obelisk/core workspace.
 
+import { existsSync } from 'node:fs';
 import { createContext, runInNewContext } from 'node:vm';
 
 import { DB_PATH, openAttuneDb, openReadDb, probeAttuneMemoryLayer } from './db.ts';
 import { buildIndex, ensureReadableSchema } from './indexer.ts';
-import { coreSchemaNeedsMigration } from './schema-migrations.ts';
+import { coreSchemaNeedsMigration, currentTokenizer, resolveFtsTokenizer } from './schema-migrations.ts';
+import { readIndexGeneration } from './index-generation.ts';
 import {
   createConfiguredBuiltinProviderRuntime,
   readPersistedProviderSettings,
@@ -426,8 +429,51 @@ function reportInvocationWaitExhausted(capMs: number): void {
   );
 }
 
+interface SearchRefreshOptions {
+  // false = `--no-refresh`: skip the pre-query index refresh and read the
+  // committed index as-is. Interactive hosts would rather see a slightly stale
+  // index than pay a build per keystroke (ADR 0019).
+  refresh?: boolean;
+}
+
+// Open the committed index read-only without creating or migrating it.
+function openCommittedIndex(): ReturnType<typeof openReadDb> {
+  if (!existsSync(DB_PATH)) {
+    throw new Error(
+      `Obelisk index not found at ${DB_PATH}; --no-refresh reads the committed index without building it. Run \`obelisk --build\` first.`,
+    );
+  }
+  return openReadDb();
+}
+
+// A read-only open cannot migrate, so an old-schema index must say what to do
+// instead of surfacing a raw "no such column".
+function rethrowForCommittedIndex(db: SqliteDb, error: unknown): never {
+  if (coreSchemaNeedsMigration(db)) {
+    throw new Error(`Obelisk index at ${DB_PATH} needs a schema upgrade before it can be searched without refresh; run \`obelisk --build\` first.`);
+  }
+  throw error;
+}
+
 // FTS search over indexed message text. Refreshes the index, then queries.
-export function searchText(text: string, opts?: Record<string, unknown>, invocation?: InvocationOptions): unknown {
+export function searchText(
+  text: string,
+  opts?: Record<string, unknown>,
+  invocation?: InvocationOptions,
+  { refresh = true }: SearchRefreshOptions = {},
+): unknown {
+  if (!refresh) {
+    const db = openCommittedIndex();
+    try {
+      try {
+        return createQueryApi(db).search(text, opts);
+      } catch (error) {
+        return rethrowForCommittedIndex(db, error);
+      }
+    } finally {
+      db.close();
+    }
+  }
   const { providerRegistry, invocationWaitOptions } = refreshQueryIndex();
   const invokingSessionId = resolveInvokingSessionIdWithWait(invocation?.invocationNonce, providerRegistry, invocationWaitOptions);
   // Query against a freshly opened snapshot so results reflect the latest
@@ -439,6 +485,89 @@ export function searchText(text: string, opts?: Record<string, unknown>, invocat
     } catch (error) {
       return rethrowUnlessSchemaBlocked(error);
     }
+  } finally {
+    db.close();
+  }
+}
+
+// Session-level FTS search for host integrations (`--search-sessions`). Same
+// refresh / read-only open / schema-blocked handling as searchText, but no
+// invoking-session nonce: a host search is not an agent looking at its own history.
+export function searchSessionsText(
+  text: string,
+  opts?: Record<string, unknown>,
+  { refresh = true }: SearchRefreshOptions = {},
+): unknown {
+  if (!refresh) {
+    const db = openCommittedIndex();
+    try {
+      try {
+        return createQueryApi(db).searchSessions(text, opts);
+      } catch (error) {
+        return rethrowForCommittedIndex(db, error);
+      }
+    } finally {
+      db.close();
+    }
+  }
+  const { providerRegistry } = refreshQueryIndex();
+  const db = openReadDb();
+  try {
+    try {
+      return createQueryApi(db, { providerRegistry }).searchSessions(text, opts);
+    } catch (error) {
+      return rethrowUnlessSchemaBlocked(error);
+    }
+  } finally {
+    db.close();
+  }
+}
+
+export const SEARCH_SESSIONS_PROTOCOL = 1;
+
+export interface IndexStatus {
+  generation: number;
+  lastBuildAt: string | null;
+  tokenizer: string;
+  sessionsBySource: Record<string, number>;
+}
+
+function tableColumns(db: SqliteDb, table: string): string[] {
+  return db.prepare(`PRAGMA table_info(${table})`).all().map(row => String(row.name));
+}
+
+// Read-only status of the committed index. Never builds, migrates, or creates
+// the index file: a host calls this to decide whether searching is worthwhile.
+export function indexStatus(): IndexStatus {
+  // OBELISK_FTS_TOKENIZER only describes an index that does not exist yet, so it
+  // is resolved (and an invalid value rejected) only then: a stray value must not
+  // break status for an index that already records its tokenizer.
+  const configuredTokenizer = () => resolveFtsTokenizer() ?? 'unicode61';
+  if (!existsSync(DB_PATH)) {
+    return { generation: 0, lastBuildAt: null, tokenizer: configuredTokenizer(), sessionsBySource: {} };
+  }
+  const db = openReadDb();
+  try {
+    const hasIndexState = tableColumns(db, 'index_state').length > 0;
+    const generation = hasIndexState ? readIndexGeneration(db) : 0;
+    const build = hasIndexState
+      ? db.prepare("SELECT mtime FROM index_state WHERE jsonl_path='__last_build__'").get()
+      : undefined;
+    const builtAt = build ? new Date(Number(build.mtime)) : null;
+    const lastBuildAt = builtAt && Number.isFinite(builtAt.getTime()) ? builtAt.toISOString() : null;
+
+    const ftsSql = db.prepare("SELECT sql FROM sqlite_master WHERE name='messages_fts'").get();
+    const tokenizer = typeof ftsSql?.sql === 'string' ? currentTokenizer(ftsSql.sql) : configuredTokenizer();
+
+    const sessionColumns = tableColumns(db, 'sessions');
+    const sourceExpr = sessionColumns.includes('source') ? "COALESCE(source, 'claude')" : "'claude'";
+    const sessionsBySource: Record<string, number> = {};
+    if (sessionColumns.length > 0) {
+      for (const row of db.prepare(`SELECT ${sourceExpr} AS source, count(*) AS n FROM sessions GROUP BY 1`).all()) {
+        sessionsBySource[String(row.source)] = Number(row.n);
+      }
+    }
+    return { generation, lastBuildAt, tokenizer, sessionsBySource };
   } finally {
     db.close();
   }

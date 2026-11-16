@@ -11,6 +11,9 @@ import {
   DB_PATH,
   buildIndex,
   searchText,
+  searchSessionsText,
+  indexStatus,
+  SEARCH_SESSIONS_PROTOCOL,
   executeQuery,
   executeAttune,
 } from '../../core/src/core.ts';
@@ -45,6 +48,40 @@ function buildFailure(force: boolean, result: BuildResult): Error {
   return new Error(`Index ${verb} was not published: ${result.reason ?? 'incomplete_snapshot'}${detail}`);
 }
 
+// The CLI package version, as `--version` reports it.
+function readCliVersion(): string {
+  const packageJson = JSON.parse(
+    readFileSync(new URL('../../../package.json', import.meta.url), 'utf8'),
+  ) as { version: string };
+  return packageJson.version;
+}
+
+async function readStdin(): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+// `--search-sessions` takes its request as one JSON object on stdin so a host
+// never has to shell-quote user text; every key besides `text` is a
+// searchSessions() option.
+function parseSearchSessionsRequest(raw: string): { text: string; opts: Record<string, unknown> } {
+  let request: unknown;
+  try {
+    request = JSON.parse(raw);
+  } catch (error) {
+    throw new Error(`--search-sessions expects a JSON object on stdin, but stdin is not valid JSON (${(error as Error).message})`, { cause: error });
+  }
+  if (request === null || typeof request !== 'object' || Array.isArray(request)) {
+    throw new Error('--search-sessions expects a JSON object on stdin with a non-empty string "text" field');
+  }
+  const { text, ...opts } = request as Record<string, unknown>;
+  if (typeof text !== 'string' || text.trim() === '') {
+    throw new Error('--search-sessions requires a non-empty string "text" field in the stdin JSON object');
+  }
+  return { text, opts };
+}
+
 async function main() {
   const args = process.argv.slice(2);
   const fail = (value: unknown): void => {
@@ -57,10 +94,30 @@ async function main() {
   };
 
   if (args[0] === '--version' || args[0] === '-v') {
-    const packageJson = JSON.parse(
-      readFileSync(new URL('../../../package.json', import.meta.url), 'utf8'),
-    ) as { version: string };
-    process.stdout.write(`${packageJson.version}\n`);
+    process.stdout.write(`${readCliVersion()}\n`);
+    return;
+  }
+  // Host-integration entry points (ADR 0019).
+  if (args[0] === '--status') {
+    try {
+      emit({
+        version: readCliVersion(),
+        searchSessionsProtocol: SEARCH_SESSIONS_PROTOCOL,
+        ...indexStatus(),
+      });
+    } catch (error) { fail(error); }
+    return;
+  }
+  if (args[0] === '--search-sessions') {
+    try {
+      let refresh = true;
+      for (const arg of args.slice(1)) {
+        if (arg === '--no-refresh') refresh = false;
+        else throw new Error(`Unknown --search-sessions option: ${arg}`);
+      }
+      const { text, opts } = parseSearchSessionsRequest(await readStdin());
+      emit(searchSessionsText(text, opts, { refresh }));
+    } catch (error) { fail(error); }
     return;
   }
   // `--build` refreshes incrementally: sessions whose transcript has since been
@@ -96,6 +153,7 @@ async function main() {
       // --nonce <token> marks this invocation in the transcript so the query
       // layer can identify the invoking session; it is not part of the FTS text.
       let nonce: string | undefined;
+      let refresh = true;
       const textParts: string[] = [];
       const searchOpts: Record<string, unknown> = {};
       const valueFlags: Record<string, string> = {
@@ -112,6 +170,7 @@ async function main() {
         }
         // Preserve the positional text argument, even when it names a flag.
         if (i === 0) { textParts.push(arg); continue; }
+        if (arg === '--no-refresh') { refresh = false; continue; }
         if (arg === '--nonce' || Object.hasOwn(valueFlags, arg)) {
           const value = rest[++i];
           if (!value) throw new Error(`${arg} requires a value`);
@@ -125,7 +184,8 @@ async function main() {
         else textParts.push(arg);
       }
       if (!textParts.length) throw new Error('--search requires text');
-      emit(searchText(textParts.join(' '), searchOpts, { invocationNonce: nonce }));
+      if (!refresh && nonce) throw new Error('--nonce cannot be combined with --no-refresh: identifying the invoking session needs the refresh that --no-refresh skips');
+      emit(searchText(textParts.join(' '), searchOpts, { invocationNonce: nonce }, { refresh }));
     } catch (error) { fail(error); }
     return;
   }
@@ -168,7 +228,7 @@ async function main() {
     }
     return;
   }
-  process.stderr.write('Usage:\n  obelisk install [skills options]\n  obelisk --build\n  obelisk --rebuild            (destructive: drops the index and re-reads only\n                               transcripts still on disk)\n  obelisk --search "text" [--limit N] [--project-path PATH] [--session-id ID] [--snippet-tokens N] [--context-limit 0..6] [--after ISO] [--before ISO] [--source ID] [--nonce TOKEN] [-- literal text...]\n  obelisk --query <file.js>\n  obelisk --attune <file.js>\n');
+  process.stderr.write('Usage:\n  obelisk install [skills options]\n  obelisk --build\n  obelisk --rebuild            (destructive: drops the index and re-reads only\n                               transcripts still on disk)\n  obelisk --search "text" [--limit N] [--project-path PATH] [--session-id ID] [--snippet-tokens N] [--context-limit 0..6] [--after ISO] [--before ISO] [--source ID] [--nonce TOKEN] [--no-refresh] [-- literal text...]\n  obelisk --search-sessions [--no-refresh]   (JSON request on stdin: {"text": "...", "limit": N, ...})\n  obelisk --status\n  obelisk --query <file.js>\n  obelisk --attune <file.js>\n');
   process.exitCode = 1;
 }
 
