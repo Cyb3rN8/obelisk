@@ -1,6 +1,7 @@
 // Copyright (C) 2026 tommy0103 and contributors.
 // SPDX-License-Identifier: AGPL-3.0-only
 
+import { renewIndexGeneration } from './index-generation.ts';
 import type { SqliteDb } from './sqlite-types.ts';
 
 const COLUMN_MIGRATIONS = [
@@ -92,6 +93,10 @@ export function migrateFtsTokenizer(db: SqliteDb, tokenizer: string | null): voi
     const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name=?").get(table) as { sql?: string } | undefined;
     if (!row?.sql) continue;
     if (currentTokenizer(row.sql) === tokenizer) continue;
+    // Search ranking changes with the tokenizer, so outstanding cursors die. Renewed
+    // before the drop: an interruption mid-migration still invalidates them, because
+    // the re-run only renews for a table whose tokenizer is still unmigrated.
+    renewIndexGeneration(db);
     db.exec(`DROP TABLE ${table}`);
     db.exec(withTokenizer(row.sql, tokenizer));
     // External content tables hold no data of their own; repopulate from the content table.

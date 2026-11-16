@@ -40,6 +40,7 @@ import {
 } from '../../../packages/core/src/provider-indexing.ts';
 import { runWriteTransaction, configureConnection, betterSqliteTransactionAdapter } from '../../../packages/core/src/tx.ts';
 import { migrateCoreSchemaColumns, migrateFtsTokenizer, resolveFtsTokenizer } from '../../../packages/core/src/schema-migrations.ts';
+import { ensureIndexGeneration, renewIndexGeneration } from '../../../packages/core/src/index-generation.ts';
 import { acquireWriterLease, writerLockPathFor } from '../../../packages/core/src/writer-lease.ts';
 import { runRetryableWriteTransaction, isBeginBusyFailure, hasUnusableTransaction } from '../../../packages/core/src/write-coordinator.ts';
 import { inferProjectPath } from '../../../packages/core/src/parsing.ts';
@@ -437,6 +438,8 @@ function buildIndex({
         if (messageFtsTriggersDropped) installSchema(db, schemaPath);
         ftsRebuilt = ensureFtsReady(db, { force });
         writeIndexMarker(db, '__last_build__');
+        if (force) renewIndexGeneration(db);
+        else ensureIndexGeneration(db);
         if (providerResult.complete) writeIndexMarker(db, '__app_last_successful_build__');
         writeIndexMarker(db, '__indexer_owner_app__');
         writeProviderIndexMarkers(db, providerPlan, providerResult);
