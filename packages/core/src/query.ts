@@ -380,6 +380,184 @@ function isTrigramMessagesFts(db: SqliteDb): boolean {
   }
 }
 
+type MatchFilters = Pick<QueryOptions,
+  'sessionId' | 'excludeSession' | 'project' | 'projectPath' | 'after' | 'before'
+  | 'cwd' | 'source' | 'includeMeta' | 'includeInactive'>;
+
+// One way to select matching messages. `from` and `where` use the fixed aliases
+// mf (messages_fts, match modes only), m (messages) and s (sessions); `where`
+// is a bare condition (no WHERE keyword, no ORDER BY / LIMIT) and `params`
+// binds its placeholders in order. A caller adds its own SELECT list, ordering
+// and LIMIT. `none` matches nothing (the query has no usable term): its where
+// is `0`, so running it anyway yields zero rows.
+type MessageMatchPlan = {
+  mode: 'match' | 'match-with-substrings' | 'like-scan' | 'none';
+  from: string;
+  where: string;
+  params: unknown[];
+  // 'rank' for the FTS modes, 'NULL' when there is no relevance order (like-scan, none).
+  rankExpr: string;
+  degraded: string | null;
+};
+
+const MATCH_FROM = 'messages_fts mf JOIN messages m ON m.uuid=mf.uuid LEFT JOIN sessions s ON s.id=m.session_id';
+const SCAN_FROM = 'messages m LEFT JOIN sessions s ON s.id=m.session_id';
+
+// Filters reference m./s. (not mf.) so the same clause serves both the MATCH
+// statement and the LIKE scan; the join makes them equal.
+function buildMessageFilters(filters: MatchFilters): { where: string; params: any[] } {
+  const { sessionId, excludeSession, project, projectPath, after, before, cwd, source,
+    includeMeta = false, includeInactive = false } = filters;
+  let where = '';
+  const params: any[] = [];
+  if (sessionId) { where += ' AND m.session_id=?'; params.push(sessionId); }
+  // Searching history from inside a session almost always hits that session's
+  // own prompt, because the query terms came from it. Excluding in SQL keeps
+  // `limit` spent on other sessions; a post-filter in the script would not.
+  const excluded = typeof excludeSession === 'string' ? [excludeSession] : (excludeSession ?? []);
+  if (excluded.length) {
+    where += ` AND m.session_id NOT IN (${excluded.map(() => '?').join(',')})`;
+    params.push(...excluded);
+  }
+  if (project)   { where += ' AND s.project LIKE ?'; params.push(project); }
+  if (projectPath) { where += ' AND s.project_path=?'; params.push(projectPath); }
+  if (after)     { where += ' AND m.timestamp>?';    params.push(after); }
+  if (before)    { where += ' AND m.timestamp<?';    params.push(before); }
+  if (cwd)       { where += ' AND m.cwd LIKE ?';     params.push(cwd); }
+  if (source && source !== 'all') { where += " AND COALESCE(m.source, s.source, 'claude')=?"; params.push(source); }
+  if (!includeMeta) where += ' AND COALESCE(m.is_meta,0)=0';
+  where += ` AND ${visibilitySql('m', includeInactive)}`;
+  return { where, params };
+}
+
+// Builds the candidate statements for matching `text` against messages, in the
+// order they must be tried: a caller runs them through runFirstWorkingPlan, and
+// the first one that does not throw wins. Nothing is executed here.
+//   'primary'     the query itself. Under a plain trigram query that is one
+//                 guarded plan; otherwise raw FTS5 syntax is honored first,
+//                 then safe per-token quoting if FTS5 rejects the raw text.
+//   'or-fallback' the broadened any-term query for callers whose primary
+//                 attempt found nothing (`fallback: 'or'`).
+function planMessageMatch(
+  db: SqliteDb,
+  text: string,
+  filters: MatchFilters,
+  attempt: 'primary' | 'or-fallback',
+): MessageMatchPlan[] {
+  const { where: filterWhere, params: filterParams } = buildMessageFilters(filters);
+  const trigram = isTrigramMessagesFts(db);
+
+  const none = (): MessageMatchPlan => ({
+    mode: 'none', from: SCAN_FROM, where: '0', params: [], rankExpr: 'NULL', degraded: null,
+  });
+  const matchPlan = (matchText: string, degraded: string | null = null): MessageMatchPlan => ({
+    mode: 'match',
+    from: MATCH_FROM,
+    where: `mf.text MATCH ?${filterWhere}`,
+    params: [matchText, ...filterParams],
+    rankExpr: 'rank',
+    degraded,
+  });
+  // Terms below the trigram minimum cannot go through MATCH; scan the
+  // content table instead. Tokens are alphanumeric-only, so no LIKE escaping
+  // is needed. rank is NULL — recency stands in for relevance here.
+  const likeScanPlan = (terms: string[], degraded: string | null): MessageMatchPlan => ({
+    mode: 'like-scan',
+    from: SCAN_FROM,
+    where: `${terms.map(() => 'm.text LIKE ?').join(' AND ')}${filterWhere}`,
+    params: [...terms.map((t) => `%${t}%`), ...filterParams],
+    rankExpr: 'NULL',
+    degraded,
+  });
+  // MATCH the indexable terms with the short ones pushed down as SQL LIKE
+  // substring conditions: the filter runs over the full MATCH result set
+  // before LIMIT, so recall does not depend on where the combined hits rank.
+  // (A JS post-filter over an overselected window returned zero rows on a
+  // real index whose top bm25 hits for the long term lacked the short one.)
+  const substringsPlan = (matchText: string, terms: string[], degraded: string | null): MessageMatchPlan => ({
+    mode: 'match-with-substrings',
+    from: MATCH_FROM,
+    where: `mf.text MATCH ?${terms.map(() => ' AND m.text LIKE ?').join('')}${filterWhere}`,
+    params: [matchText, ...terms.map((t) => `%${t}%`), ...filterParams],
+    rankExpr: 'rank',
+    degraded,
+  });
+  // Under trigram, terms shorter than three code points silently constrain
+  // nothing (false positives next to longer terms, zero hits alone). Split
+  // the tokens: MATCH the indexable ones, then require the short ones as
+  // literal substrings; with nothing indexable, fall back to a LIKE scan.
+  const tokensGuardedPlan = (tokens: string[]): MessageMatchPlan => {
+    const unique = [...new Set(tokens)];
+    const short = unique.filter((token) => [...token].length < 3);
+    const long = unique.filter((token) => [...token].length >= 3);
+    const matchText = long.slice(0, 12).map((token) => `"${token}"`).join(' ');
+    if (short.length === 0) return matchText ? matchPlan(matchText) : none();
+    if (long.length === 0) return likeScanPlan(short, 'like-scan');
+    return substringsPlan(matchText, short, 'short-token-post-filter');
+  };
+
+  if (attempt === 'or-fallback') {
+    // Under trigram a sub-3-codepoint OR term matches nothing, so drop it rather than send it.
+    const orTokens = queryTokens(text).filter((token) => !trigram || [...token].length >= 3);
+    const broad = buildSafeFtsQuery(orTokens.join(' '), ' OR ');
+    return [broad ? matchPlan(broad) : none()];
+  }
+
+  if (trigram && isPlainQuery(text)) return [tokensGuardedPlan(queryTokens(text))];
+
+  // FTS5 drops sub-3-codepoint terms from raw syntax exactly as it does
+  // from a plain query, and it does not fail on them, so this path used to
+  // return the silent false positives the guard exists to remove:
+  // search('"quick" ok') answered with rows that never contained 'ok'.
+  // Requiring the short terms as substrings restores the constraint, but
+  // only where it means the same thing — with OR / NOT / NEAR present an
+  // added AND would answer a different question, and with no indexable
+  // term there is nothing to intersect with. Those two are reported
+  // instead of rewritten, so a caller that gets no help still knows it.
+  const rawTerms = [...new Set(queryTokens(text))].filter((token) => !FTS5_OPERATOR_TOKENS.has(token));
+  const rawShort = rawTerms.filter((token) => [...token].length < 3);
+  const enforceable = trigram && rawShort.length > 0
+    && rawTerms.some((token) => [...token].length >= 3)
+    && !FTS5_DISJUNCTION.test(text);
+  const raw = enforceable
+    ? substringsPlan(text, rawShort, 'short-token-post-filter')
+    : matchPlan(text, trigram && rawShort.length > 0 ? 'short-token-unguarded' : null);
+  // Honor raw FTS5 syntax when the query is valid, but never crash on
+  // ordinary input (hyphens, punctuation) that FTS5 would parse as
+  // operators: fall back to safe per-token quoting — routed through the
+  // same short-token guard under trigram, since the extracted tokens can
+  // be short too ('gen-itgc ok').
+  let safe: MessageMatchPlan;
+  if (trigram) {
+    safe = tokensGuardedPlan(queryTokens(text));
+  } else {
+    const safeText = buildSafeFtsQuery(text);
+    safe = safeText ? matchPlan(safeText) : none();
+  }
+  return [raw, safe];
+}
+
+// Runs plans in order and returns the first whose `run` does not throw, along
+// with its value. A `none` plan is not run; it yields `empty`. The last plan's
+// error propagates, so only a failure that has a fallback behind it is absorbed.
+function runFirstWorkingPlan<T>(
+  plans: MessageMatchPlan[],
+  run: (plan: MessageMatchPlan) => T,
+  empty: T,
+): { plan: MessageMatchPlan; value: T } {
+  for (let i = 0; i < plans.length; i++) {
+    const plan = plans[i];
+    if (plan.mode === 'none') return { plan, value: empty };
+    if (i === plans.length - 1) return { plan, value: run(plan) };
+    try {
+      return { plan, value: run(plan) };
+    } catch {
+      // fall through to the next candidate
+    }
+  }
+  throw new Error('runFirstWorkingPlan requires at least one plan');
+}
+
 const SNIPPET_BEFORE = 60;
 const SNIPPET_AFTER = 100;
 
@@ -459,27 +637,6 @@ function createQueryApi(
     if (snippetTokens !== undefined && (!Number.isInteger(snippetTokens) || snippetTokens < 1 || snippetTokens > 64)) {
       throw new RangeError('search() snippetTokens must be an integer from 1 to 64');
     }
-    // Filters reference m./s. (not mf.) so the same clause serves both the
-    // MATCH statement and the LIKE fallback scan; the join makes them equal.
-    let filterWhere = '';
-    const filterParams: any[] = [];
-    if (sessionId) { filterWhere += ' AND m.session_id=?'; filterParams.push(sessionId); }
-    // Searching history from inside a session almost always hits that session's
-    // own prompt, because the query terms came from it. Excluding in SQL keeps
-    // `limit` spent on other sessions; a post-filter in the script would not.
-    const excluded = typeof excludeSession === 'string' ? [excludeSession] : (excludeSession ?? []);
-    if (excluded.length) {
-      filterWhere += ` AND m.session_id NOT IN (${excluded.map(() => '?').join(',')})`;
-      filterParams.push(...excluded);
-    }
-    if (project)   { filterWhere += ' AND s.project LIKE ?'; filterParams.push(project); }
-    if (projectPath) { filterWhere += ' AND s.project_path=?'; filterParams.push(projectPath); }
-    if (after)     { filterWhere += ' AND m.timestamp>?';    filterParams.push(after); }
-    if (before)    { filterWhere += ' AND m.timestamp<?';    filterParams.push(before); }
-    if (cwd)       { filterWhere += ' AND m.cwd LIKE ?';     filterParams.push(cwd); }
-    if (source && source !== 'all') { filterWhere += " AND COALESCE(m.source, s.source, 'claude')=?"; filterParams.push(source); }
-    if (!includeMeta) filterWhere += ' AND COALESCE(m.is_meta,0)=0';
-    filterWhere += ` AND ${visibilitySql('m', includeInactive)}`;
     const trigram = isTrigramMessagesFts(db);
     // snippet() only exists under MATCH, and under trigram it counts 3-character
     // grams, so 16 "tokens" is about 18 characters. LOCAL: both the LIKE scan and
@@ -499,99 +656,24 @@ function createQueryApi(
              COALESCE(m.visibility,'visible') AS visibility,m.source as m_source,
              s.id as s_id,${titleExpr('s')} as s_title,s.project as s_project,s.started_at as s_started,
              s.source as s_source`;
-    const stmt = db.prepare(`${selectCols()},
-             rank
-      FROM messages_fts mf JOIN messages m ON m.uuid=mf.uuid LEFT JOIN sessions s ON s.id=m.session_id
-      WHERE mf.text MATCH ?${filterWhere} ORDER BY rank LIMIT ?`);
-    const runMatch = (matchText: string, rowLimit: number = limit): DbRow[] =>
-      stmt.all(matchText, ...filterParams, rowLimit);
-
-    // Terms below the trigram minimum cannot go through MATCH; scan the
-    // content table instead. Tokens are alphanumeric-only, so no LIKE escaping
-    // is needed. rank is NULL — recency stands in for relevance here.
-    const runLikeScan = (terms: string[]): DbRow[] => {
-      const likeWhere = terms.map(() => 'm.text LIKE ?').join(' AND ');
-      const likeStmt = db.prepare(`${selectCols(false)},
-             NULL as rank
-      FROM messages m LEFT JOIN sessions s ON s.id=m.session_id
-      WHERE ${likeWhere}${filterWhere} ORDER BY m.timestamp DESC LIMIT ?`);
-      return likeStmt.all(...terms.map((t) => `%${t}%`), ...filterParams, limit);
+    const filters: MatchFilters = {
+      sessionId, excludeSession, project, projectPath, after, before, cwd, source, includeMeta, includeInactive,
     };
-
-    // MATCH the indexable terms with the short ones pushed down as SQL LIKE
-    // substring conditions: the filter runs over the full MATCH result set
-    // before LIMIT, so recall does not depend on where the combined hits rank.
-    // (A JS post-filter over an overselected window returned zero rows on a
-    // real index whose top bm25 hits for the long term lacked the short one.)
-    const runMatchWithSubstrings = (matchText: string, terms: string[]): DbRow[] => {
-      const likeAnd = terms.map(() => ' AND m.text LIKE ?').join('');
-      const guarded = db.prepare(`${selectCols()},
-             rank
-      FROM messages_fts mf JOIN messages m ON m.uuid=mf.uuid LEFT JOIN sessions s ON s.id=m.session_id
-      WHERE mf.text MATCH ?${likeAnd}${filterWhere} ORDER BY rank LIMIT ?`);
-      return guarded.all(matchText, ...terms.map((t) => `%${t}%`), ...filterParams, limit);
+    // The plan owns FROM/WHERE/params/rank; this statement only adds the
+    // columns the result assembly below needs, plus ordering and LIMIT.
+    const runPlan = (plan: MessageMatchPlan): DbRow[] => {
+      const rankSelect = plan.rankExpr === 'rank' ? 'rank' : `${plan.rankExpr} as rank`;
+      const orderBy = plan.mode === 'like-scan' ? 'm.timestamp DESC' : 'rank';
+      return db.prepare(`${selectCols(plan.mode !== 'like-scan')},
+             ${rankSelect}
+      FROM ${plan.from}
+      WHERE ${plan.where} ORDER BY ${orderBy} LIMIT ?`).all(...plan.params, limit);
     };
-
-    // Under trigram, terms shorter than three code points silently constrain
-    // nothing (false positives next to longer terms, zero hits alone). Split
-    // the tokens: MATCH the indexable ones, then require the short ones as
-    // literal substrings; with nothing indexable, fall back to a LIKE scan.
-    const runTokensGuarded = (tokens: string[]): { rows: DbRow[]; degraded: string | null } => {
-      const unique = [...new Set(tokens)];
-      const short = unique.filter((token) => [...token].length < 3);
-      const long = unique.filter((token) => [...token].length >= 3);
-      const matchText = long.slice(0, 12).map((token) => `"${token}"`).join(' ');
-      if (short.length === 0) return { rows: matchText ? runMatch(matchText) : [], degraded: null };
-      if (long.length === 0) return { rows: runLikeScan(short), degraded: 'like-scan' };
-      return { rows: runMatchWithSubstrings(matchText, short), degraded: 'short-token-post-filter' };
-    };
-
-    let rows: DbRow[];
-    let degraded: string | null = null;
-    if (trigram && isPlainQuery(text)) {
-      ({ rows, degraded } = runTokensGuarded(queryTokens(text)));
-    } else {
-      // FTS5 drops sub-3-codepoint terms from raw syntax exactly as it does
-      // from a plain query, and it does not fail on them, so this path used to
-      // return the silent false positives the guard exists to remove:
-      // search('"quick" ok') answered with rows that never contained 'ok'.
-      // Requiring the short terms as substrings restores the constraint, but
-      // only where it means the same thing — with OR / NOT / NEAR present an
-      // added AND would answer a different question, and with no indexable
-      // term there is nothing to intersect with. Those two are reported
-      // instead of rewritten, so a caller that gets no help still knows it.
-      const rawTerms = [...new Set(queryTokens(text))].filter((token) => !FTS5_OPERATOR_TOKENS.has(token));
-      const rawShort = rawTerms.filter((token) => [...token].length < 3);
-      const enforceable = trigram && rawShort.length > 0
-        && rawTerms.some((token) => [...token].length >= 3)
-        && !FTS5_DISJUNCTION.test(text);
-      // Honor raw FTS5 syntax when the query is valid, but never crash on
-      // ordinary input (hyphens, punctuation) that FTS5 would parse as
-      // operators: fall back to safe per-token quoting — routed through the
-      // same short-token guard under trigram, since the extracted tokens can
-      // be short too ('gen-itgc ok').
-      try {
-        if (enforceable) {
-          rows = runMatchWithSubstrings(text, rawShort);
-          degraded = 'short-token-post-filter';
-        } else {
-          rows = runMatch(text);
-          if (trigram && rawShort.length > 0) degraded = 'short-token-unguarded';
-        }
-      } catch {
-        if (trigram) {
-          ({ rows, degraded } = runTokensGuarded(queryTokens(text)));
-        } else {
-          const safe = buildSafeFtsQuery(text);
-          rows = safe ? runMatch(safe) : [];
-        }
-      }
-    }
+    const primary = runFirstWorkingPlan(planMessageMatch(db, text, filters, 'primary'), runPlan, [] as DbRow[]);
+    let rows = primary.value;
+    const degraded = primary.plan.degraded;
     if (rows.length === 0 && fallback === 'or') {
-      // Under trigram a sub-3-codepoint OR term matches nothing, so drop it rather than send it.
-      const orTokens = queryTokens(text).filter((token) => !trigram || [...token].length >= 3);
-      const broad = buildSafeFtsQuery(orTokens.join(' '), ' OR ');
-      rows = broad ? runMatch(broad) : [];
+      rows = runFirstWorkingPlan(planMessageMatch(db, text, filters, 'or-fallback'), runPlan, [] as DbRow[]).value;
     }
     const snippetTerms = queryTokens(text);
     if (!sqlSnippet) rows = trimToSnippet(rows, snippetTerms);
