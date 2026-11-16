@@ -259,6 +259,37 @@ tokenizer migration); a host paging with `offset` should restart when it
 changes. `degraded` comes from the primary attempt even when the result is
 empty, unlike `search()`'s per-hit marker.
 
+##### Command line: `--search-sessions` and `--status`
+
+Host programs reach `searchSessions` without a script file:
+
+```bash
+printf '{"text":"needle","limit":20,"sources":["claude"]}' \
+  | obelisk --search-sessions [--no-refresh]
+obelisk --status
+```
+
+`--search-sessions` reads one JSON object on stdin; `text` is required and must
+be a non-empty string, every other key is an `opts` entry above. Stdout is the
+return value (pretty-printed JSON). Failures use the `{ error, stack }` envelope
+with exit 1: invalid stdin JSON, a missing or empty `text`, an unknown
+command-line option, or a `searchSessions()` `RangeError`. Without `--no-refresh`
+the index is refreshed first, as `--search` does; with it the committed index is
+read read-only (exit 1 naming the index path if none exists).
+
+`--status` prints:
+
+| Key | Meaning |
+| --- | --- |
+| `version` | CLI package version, as `--version` reports it |
+| `searchSessionsProtocol` | `1`; incremented on an incompatible change to the stdin request or the `searchSessions` response |
+| `generation` | Index generation as in `searchSessions().generation`; `0` when none is recorded or no index exists |
+| `lastBuildAt` | ISO time of the last build, or `null` |
+| `tokenizer` | FTS5 tokenizer of the index (`unicode61` when `messages_fts` names none); the configured one when no index exists |
+| `sessionsBySource` | Session count per provider (`source`, missing = `claude`); `{}` for an empty or absent index |
+
+`--status` is read-only: it never builds, migrates, or creates the index file.
+
 #### `messages(optsOrUuid)`
 
 Bounded message retrieval (CLI 0.3.0+). Choose exactly one locator:

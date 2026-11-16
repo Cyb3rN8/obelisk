@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 export const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const cliEntry = join(repoRoot, 'packages', 'cli', 'dist', 'cli', 'src', 'obelisk.js');
 
-export function runCli(args, { home, env = {}, cwd = repoRoot } = {}) {
+export function runCli(args, { home, env = {}, cwd = repoRoot, input } = {}) {
   const childEnv = {
     ...process.env,
     ...(home ? {
@@ -35,5 +35,6 @@ export function runCli(args, { home, env = {}, cwd = repoRoot } = {}) {
     cwd,
     env: childEnv,
     encoding: 'utf8',
+    ...(input === undefined ? {} : { input }),
   });
 }

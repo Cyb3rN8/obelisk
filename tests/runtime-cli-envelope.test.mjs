@@ -18,8 +18,9 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 
 import { runCli as runRuntime } from './cli-test-helpers.mjs';
 import { makeTempDir } from './temp-dirs.mjs';
@@ -255,4 +256,224 @@ test('--search preserves option-like positional text and supports the -- delimit
     assert.equal(invalid.status, 1);
     assert.equal(JSON.parse(invalid.stdout).error, error);
   }
+});
+
+// --- Host-integration entry points (docs/adr/0019-session-search-cli-for-host-integrations.md) ---
+// `--search-sessions` reads one JSON request on stdin; `--status` prints the
+// machine-readable availability record. Both are the contract Orca depends on.
+
+const STATUS_KEYS = ['generation', 'lastBuildAt', 'searchSessionsProtocol', 'sessionsBySource', 'tokenizer', 'version'];
+
+function indexPathOf(home) {
+  return join(home, '.obelisk', 'obelisk.sqlite');
+}
+
+function buildIndexIn(home) {
+  const built = runRuntime(['--build'], { home });
+  assert.equal(built.status, 0, built.stderr || built.stdout);
+}
+
+function searchSessionsCli(home, request, flags = ['--no-refresh'], env = {}) {
+  return runRuntime(['--search-sessions', ...flags], {
+    home, env, input: typeof request === 'string' ? request : JSON.stringify(request),
+  });
+}
+
+function addClaudeTranscript(home, id, content) {
+  const captured = readFileSync(new URL('./fixtures/claude/custom-title-session.jsonl', import.meta.url), 'utf8')
+    .trim().split('\n').map(line => JSON.parse(line)).find(row => row.type === 'user');
+  const dir = join(home, '.claude', 'projects', id);
+  mkdirSync(dir, { recursive: true });
+  const row = {
+    ...captured, sessionId: `${id}-session`, uuid: `${id}-0`, parentUuid: null,
+    timestamp: '2026-09-28T10:00:00.000Z', message: { role: 'user', content },
+  };
+  writeFileSync(join(dir, `${id}-session.jsonl`), JSON.stringify(row) + '\n');
+}
+
+function forgetLastBuild(home) {
+  const db = new DatabaseSync(indexPathOf(home));
+  try {
+    db.prepare("DELETE FROM index_state WHERE jsonl_path='__last_build__'").run();
+  } finally {
+    db.close();
+  }
+}
+
+test('--status on a HOME without an index reports an empty index and creates no file', () => {
+  const home = tempHome();
+  const result = runRuntime(['--status'], { home });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const payload = JSON.parse(result.stdout);
+  assert.deepEqual(Object.keys(payload).sort(), STATUS_KEYS);
+  assert.equal(payload.searchSessionsProtocol, 1);
+  assert.equal(payload.generation, 0);
+  assert.equal(payload.lastBuildAt, null);
+  assert.equal(payload.tokenizer, 'unicode61');
+  assert.deepEqual(payload.sessionsBySource, {});
+  assert.equal(payload.version, runRuntime(['--version'], { home }).stdout.trim());
+  assert.equal(existsSync(indexPathOf(home)), false, '--status must never create the index');
+});
+
+test('--status reports the configured tokenizer when no index exists', () => {
+  const home = tempHome();
+  const result = runRuntime(['--status'], { home, env: { OBELISK_FTS_TOKENIZER: 'trigram' } });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal(JSON.parse(result.stdout).tokenizer, 'trigram');
+  assert.equal(existsSync(indexPathOf(home)), false);
+});
+
+test('--status on a built index reports generation, build time, tokenizer and per-source counts', () => {
+  const { home } = populatedSearchHome();
+  buildIndexIn(home);
+  const before = readFileSync(indexPathOf(home));
+  const result = runRuntime(['--status'], { home });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const payload = JSON.parse(result.stdout);
+  assert.deepEqual(Object.keys(payload).sort(), STATUS_KEYS);
+  assert.equal(payload.searchSessionsProtocol, 1);
+  assert.ok(Number.isInteger(payload.generation) && payload.generation > 0, `generation ${payload.generation}`);
+  assert.equal(typeof payload.lastBuildAt, 'string');
+  assert.equal(new Date(payload.lastBuildAt).toISOString(), payload.lastBuildAt);
+  assert.ok(Math.abs(Date.now() - Date.parse(payload.lastBuildAt)) < 120_000, payload.lastBuildAt);
+  assert.equal(payload.tokenizer, 'unicode61');
+  assert.deepEqual(payload.sessionsBySource, { claude: 2 });
+  assert.deepEqual(readFileSync(indexPathOf(home)), before, '--status must not write the index');
+});
+
+test('--status reads the tokenizer from the index, not the environment', () => {
+  const { home } = populatedSearchHome();
+  const built = runRuntime(['--build'], { home, env: { OBELISK_FTS_TOKENIZER: 'trigram' } });
+  assert.equal(built.status, 0, built.stderr || built.stdout);
+
+  const result = runRuntime(['--status'], { home });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal(JSON.parse(result.stdout).tokenizer, 'trigram');
+});
+
+test('--search-sessions --no-refresh reads a JSON request from stdin and returns the searchSessions envelope', () => {
+  const { home } = populatedSearchHome();
+  buildIndexIn(home);
+  const result = searchSessionsCli(home, { text: 'needle', limit: 5 });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const payload = JSON.parse(result.stdout);
+  assert.deepEqual(Object.keys(payload).sort(), ['degraded', 'generation', 'hasMore', 'sessions']);
+  assert.equal(payload.hasMore, false);
+  assert.deepEqual(payload.sessions.map(row => row.sessionId).sort(), ['other-session', 'target-session']);
+  assert.ok(payload.generation > 0);
+  assert.equal(payload.degraded, null);
+});
+
+test('--search-sessions applies request options such as limit and sources', () => {
+  const { home } = populatedSearchHome();
+  buildIndexIn(home);
+
+  const limited = JSON.parse(searchSessionsCli(home, { text: 'needle', limit: 1 }).stdout);
+  assert.equal(limited.sessions.length, 1);
+  assert.equal(limited.hasMore, true);
+
+  const other = JSON.parse(searchSessionsCli(home, { text: 'needle', sources: ['codex'] }).stdout);
+  assert.deepEqual(other.sessions, []);
+});
+
+test('--search-sessions stdin request keeps quotes and dashes', () => {
+  const { home } = populatedSearchHome();
+  buildIndexIn(home);
+  const result = searchSessionsCli(home, { text: '"quoted" -- x' });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const payload = JSON.parse(result.stdout);
+  assert.ok(Array.isArray(payload.sessions));
+  assert.equal(typeof payload.hasMore, 'boolean');
+});
+
+test('--search-sessions names itself and JSON when stdin is not valid JSON', () => {
+  const { home } = populatedSearchHome();
+  buildIndexIn(home);
+  const result = searchSessionsCli(home, 'not json');
+
+  assert.equal(result.status, 1);
+  const payload = JSON.parse(result.stdout);
+  assert.match(payload.error, /--search-sessions/);
+  assert.match(payload.error, /JSON/);
+  assert.equal(typeof payload.stack, 'string');
+});
+
+test('--search-sessions names text when the request has none, an empty one, or is not an object', () => {
+  const { home } = populatedSearchHome();
+  buildIndexIn(home);
+  for (const request of ['{}', '{"text":""}', '{"text":"   "}', '{"text":3}', '[]', '"needle"', 'null']) {
+    const result = searchSessionsCli(home, request);
+    assert.equal(result.status, 1, request);
+    const { error } = JSON.parse(result.stdout);
+    assert.match(error, /--search-sessions/, request);
+    assert.match(error, /text/, request);
+  }
+});
+
+test('--search-sessions surfaces searchSessions validation errors through the error envelope', () => {
+  const { home } = populatedSearchHome();
+  buildIndexIn(home);
+  const result = searchSessionsCli(home, { text: 'needle', limit: -1 });
+
+  assert.equal(result.status, 1);
+  const payload = JSON.parse(result.stdout);
+  assert.match(payload.error, /^searchSessions\(\) limit /);
+  assert.equal(typeof payload.stack, 'string');
+});
+
+test('--search-sessions rejects unknown command-line options', () => {
+  const { home } = populatedSearchHome();
+  buildIndexIn(home);
+  const result = searchSessionsCli(home, { text: 'needle' }, ['--no-refresh', '--typo']);
+
+  assert.equal(result.status, 1);
+  assert.equal(JSON.parse(result.stdout).error, 'Unknown --search-sessions option: --typo');
+});
+
+test('--search-sessions --no-refresh on a HOME without an index fails naming the index path and creates nothing', () => {
+  const home = tempHome();
+  const result = searchSessionsCli(home, { text: 'needle' });
+
+  assert.equal(result.status, 1);
+  const { error } = JSON.parse(result.stdout);
+  assert.ok(error.includes(indexPathOf(home)), error);
+  assert.match(error, /--build/);
+  assert.equal(existsSync(indexPathOf(home)), false, '--no-refresh must not create the index');
+});
+
+test('--no-refresh skips the pre-query refresh; without it new transcripts are indexed first', () => {
+  const { home } = populatedSearchHome();
+  buildIndexIn(home);
+  // Drop the build debounce marker so a refresh would really run, then add a
+  // transcript the committed index has never seen.
+  forgetLastBuild(home);
+  addClaudeTranscript(home, 'fresh', 'zebrafinchword is only in the new transcript');
+
+  const skipped = searchSessionsCli(home, { text: 'zebrafinchword' });
+  assert.equal(skipped.status, 0, skipped.stderr || skipped.stdout);
+  assert.deepEqual(JSON.parse(skipped.stdout).sessions, [], '--no-refresh must read the committed index as-is');
+
+  const skippedSearch = runRuntime(['--search', 'zebrafinchword', '--no-refresh'], { home });
+  assert.equal(skippedSearch.status, 0, skippedSearch.stderr || skippedSearch.stdout);
+  assert.deepEqual(JSON.parse(skippedSearch.stdout), [], '--search --no-refresh must not refresh either');
+
+  const refreshed = runRuntime(['--search', 'zebrafinchword'], { home });
+  assert.equal(refreshed.status, 0, refreshed.stderr || refreshed.stdout);
+  assert.equal(JSON.parse(refreshed.stdout).length, 1, '--search without --no-refresh refreshes first');
+});
+
+test('--search-sessions without --no-refresh refreshes the index like --search does', () => {
+  const { home } = populatedSearchHome();
+  buildIndexIn(home);
+  forgetLastBuild(home);
+  addClaudeTranscript(home, 'fresh', 'zebrafinchword is only in the new transcript');
+
+  const result = searchSessionsCli(home, { text: 'zebrafinchword' }, []);
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.deepEqual(JSON.parse(result.stdout).sessions.map(row => row.sessionId), ['fresh-session']);
 });

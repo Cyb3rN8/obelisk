@@ -46,7 +46,7 @@ export function resolveFtsTokenizer(env: Record<string, string | undefined> = pr
   return configured;
 }
 
-function currentTokenizer(createSql: string): string {
+export function currentTokenizer(createSql: string): string {
   const match = /tokenize\s*=\s*(['"])(.*?)\1/i.exec(createSql);
   // FTS5 defaults to unicode61 when the clause is absent.
   return match ? match[2].trim() : 'unicode61';
