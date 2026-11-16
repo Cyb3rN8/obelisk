@@ -3,14 +3,18 @@
 
 // Tier 1 contract golden tests (see docs/adr/0002-two-tier-runtime-contract.md).
 //
-// These lock the four-verb CLI I/O envelope at the process boundary so the
+// These lock the CLI I/O envelope at the process boundary so the
 // upcoming TypeScript / runtime-core refactor cannot silently change what an
-// agent (through the CLI or a future MCP transport) observes on stdout:
-//   --build   -> { ok: true, db }   (incremental)
-//   --rebuild -> { ok: true, db }   (force; same envelope, destructive path)
-//   --search  -> JSON array
-//   --query   -> pretty-printed JSON result, or { error, stack } + exit 1 on throw
-//   --attune  -> pretty-printed JSON result, or { error, stack } + exit 1 on throw
+// agent or host (through the CLI or a future MCP transport) observes on stdout:
+//   --build           -> { ok: true, db }   (incremental)
+//   --rebuild         -> { ok: true, db }   (force; same envelope, destructive path)
+//   --search          -> JSON array
+//   --search-sessions -> { sessions, hasMore, generation, degraded } for a JSON
+//                        request on stdin, or { error, stack } + exit 1
+//   --status          -> { version, searchSessionsProtocol, generation,
+//                        lastBuildAt, tokenizer, sessionsBySource }
+//   --query           -> pretty-printed JSON result, or { error, stack } + exit 1 on throw
+//   --attune          -> pretty-printed JSON result, or { error, stack } + exit 1 on throw
 //
 // The sandbox contract (query cannot call attune helpers, attune exposes only
 // remember/forget, etc.) is covered separately in runtime.test.mjs; this file is
@@ -354,6 +358,15 @@ test('--status reads the tokenizer from the index, not the environment', () => {
   assert.equal(JSON.parse(result.stdout).tokenizer, 'trigram');
 });
 
+test('--status ignores an invalid OBELISK_FTS_TOKENIZER when the index records its tokenizer', () => {
+  const { home } = populatedSearchHome();
+  buildIndexIn(home);
+
+  const result = runRuntime(['--status'], { home, env: { OBELISK_FTS_TOKENIZER: 'not a tokenizer!' } });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal(JSON.parse(result.stdout).tokenizer, 'unicode61');
+});
+
 test('--search-sessions --no-refresh reads a JSON request from stdin and returns the searchSessions envelope', () => {
   const { home } = populatedSearchHome();
   buildIndexIn(home);
@@ -424,6 +437,28 @@ test('--search-sessions surfaces searchSessions validation errors through the er
   const payload = JSON.parse(result.stdout);
   assert.match(payload.error, /^searchSessions\(\) limit /);
   assert.equal(typeof payload.stack, 'string');
+});
+
+test('--search-sessions rejects an unknown request key, naming it', () => {
+  const { home } = populatedSearchHome();
+  buildIndexIn(home);
+  const result = searchSessionsCli(home, { text: 'needle', bogus: 1 });
+
+  assert.equal(result.status, 1);
+  const payload = JSON.parse(result.stdout);
+  assert.match(payload.error, /^searchSessions\(\) does not accept option "bogus"/);
+  assert.equal(typeof payload.stack, 'string');
+});
+
+test('--search-sessions rejects a request value of the wrong type, naming the option and value', () => {
+  const { home } = populatedSearchHome();
+  buildIndexIn(home);
+  const result = searchSessionsCli(home, { text: 'needle', limit: '20' });
+
+  assert.equal(result.status, 1);
+  const payload = JSON.parse(result.stdout);
+  assert.match(payload.error, /^searchSessions\(\) limit /);
+  assert.match(payload.error, /got "20"/);
 });
 
 test('--search-sessions rejects unknown command-line options', () => {

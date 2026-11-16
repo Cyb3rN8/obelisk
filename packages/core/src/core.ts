@@ -4,7 +4,8 @@
 // Obelisk Core package (see docs/adr/0003-core-typescript-esm-precompiled.md).
 //
 // The single shared implementation behind every transport. The CLI and later
-// the MCP server are thin shells over these four functions;
+// the MCP server are thin shells over the exported entry points (buildIndex,
+// searchText, searchSessionsText, indexStatus, executeQuery, executeAttune);
 // none of them re-implement retrieval or own the DB lifecycle.
 //
 // Authored in TypeScript with erasable-only syntax so Node can run it directly
@@ -538,9 +539,12 @@ function tableColumns(db: SqliteDb, table: string): string[] {
 // Read-only status of the committed index. Never builds, migrates, or creates
 // the index file: a host calls this to decide whether searching is worthwhile.
 export function indexStatus(): IndexStatus {
-  const configuredTokenizer = resolveFtsTokenizer() ?? 'unicode61';
+  // OBELISK_FTS_TOKENIZER only describes an index that does not exist yet, so it
+  // is resolved (and an invalid value rejected) only then: a stray value must not
+  // break status for an index that already records its tokenizer.
+  const configuredTokenizer = () => resolveFtsTokenizer() ?? 'unicode61';
   if (!existsSync(DB_PATH)) {
-    return { generation: 0, lastBuildAt: null, tokenizer: configuredTokenizer, sessionsBySource: {} };
+    return { generation: 0, lastBuildAt: null, tokenizer: configuredTokenizer(), sessionsBySource: {} };
   }
   const db = openReadDb();
   try {
@@ -553,7 +557,7 @@ export function indexStatus(): IndexStatus {
     const lastBuildAt = builtAt && Number.isFinite(builtAt.getTime()) ? builtAt.toISOString() : null;
 
     const ftsSql = db.prepare("SELECT sql FROM sqlite_master WHERE name='messages_fts'").get();
-    const tokenizer = typeof ftsSql?.sql === 'string' ? currentTokenizer(ftsSql.sql) : configuredTokenizer;
+    const tokenizer = typeof ftsSql?.sql === 'string' ? currentTokenizer(ftsSql.sql) : configuredTokenizer();
 
     const sessionColumns = tableColumns(db, 'sessions');
     const sourceExpr = sessionColumns.includes('source') ? "COALESCE(source, 'claude')" : "'claude'";

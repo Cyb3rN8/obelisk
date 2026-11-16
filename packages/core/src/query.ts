@@ -589,6 +589,48 @@ function makeSnippet(
   return (start > 0 ? '…' : '') + text.slice(start, end) + (end < text.length ? '…' : '');
 }
 
+// Fallback when no query term appears literally in the hit (e.g. FTS5 syntax):
+// the head of the text, with '…' marking the cut edge as makeSnippet does.
+function headSnippet(text: string, chars: number): string {
+  if (text.length <= chars) return text;
+  let end = chars;
+  if ((text.charCodeAt(end) & 0xFC00) === 0xDC00) end++;
+  return end < text.length ? `${text.slice(0, end)}…` : text;
+}
+
+// Runs `read` inside one read transaction so every statement sees the same
+// snapshot. A caller already in a transaction has pinned a snapshot itself, so
+// `read` just runs in it. A failed statement inside `read` (the FTS5 syntax
+// errors runFirstWorkingPlan absorbs) does not end the transaction, so plan
+// fallback still reads the same snapshot. The transaction is always closed; a
+// close failure never masks an error from `read`.
+function inReadSnapshot<T>(db: SqliteDb, read: () => T): T {
+  const handle = db as unknown as { isTransaction?: unknown; inTransaction?: unknown };
+  const active = (): boolean | null => {
+    if (typeof handle.isTransaction === 'boolean') return handle.isTransaction;
+    if (typeof handle.inTransaction === 'boolean') return handle.inTransaction;
+    return null;
+  };
+  if (active() === true) return read();
+  const close = () => {
+    if (active() !== false) db.exec('ROLLBACK');
+  };
+  db.exec('BEGIN');
+  let value: T;
+  try {
+    value = read();
+  } catch (error) {
+    try {
+      close();
+    } catch {
+      // the read error is the one worth reporting
+    }
+    throw error;
+  }
+  close();
+  return value;
+}
+
 interface SearchSessionsOptions {
   limit?: number;
   offset?: number;
@@ -600,6 +642,10 @@ interface SearchSessionsOptions {
   snippetChars?: number;
   fallback?: 'or';
 }
+
+const SEARCH_SESSIONS_OPTION_KEYS: ReadonlySet<string> = new Set([
+  'limit', 'offset', 'sources', 'after', 'cwdPrefixes', 'scope', 'sort', 'snippetChars', 'fallback',
+]);
 
 interface SessionSearchHit {
   sessionId: string;
@@ -618,6 +664,7 @@ interface SessionSearchHit {
     role: string;
     contentType: string | null;
     timestamp: string | null;
+    agentId: string | null;
     snippet: string;
     highlights: Array<[number, number]>;
   };
@@ -847,31 +894,52 @@ function createQueryApi(
   // hundreds of hits takes one row. Session-level filters are appended to the
   // plan's WHERE; they narrow which messages count, never how text matches.
   const searchSessions = (text: string, opts: SearchSessionsOptions = {}): SearchSessionsResult => {
-    const {
-      limit = 20,
-      offset = 0,
-      sources,
-      after,
-      cwdPrefixes,
-      scope = 'all',
-      sort = 'relevance',
-      snippetChars = 160,
-      fallback,
-    } = opts;
-    if (!Number.isInteger(limit) || limit < 0 || limit > 200) {
-      throw new RangeError(`searchSessions() limit must be an integer from 0 to 200 (got ${limit})`);
+    // Strict like messages(): a host sends these keys over the CLI as JSON, so an
+    // unknown key or a wrong type is a caller bug to report, never a silent no-op.
+    // A new key bumps SEARCH_SESSIONS_PROTOCOL; older versions reject it here.
+    if (opts === null || typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new TypeError(`searchSessions() options must be an object (got ${JSON.stringify(opts)})`);
     }
-    if (!Number.isInteger(offset) || offset < 0) {
-      throw new RangeError(`searchSessions() offset must be a non-negative integer (got ${offset})`);
+    for (const key of Object.keys(opts)) {
+      if (!SEARCH_SESSIONS_OPTION_KEYS.has(key)) {
+        throw new TypeError(`searchSessions() does not accept option "${key}"; accepted options: ${[...SEARCH_SESSIONS_OPTION_KEYS].join(', ')}`);
+      }
     }
-    if (!Number.isInteger(snippetChars) || snippetChars < 1) {
-      throw new RangeError(`searchSessions() snippetChars must be a positive integer (got ${snippetChars})`);
+    const shown = (value: unknown) => JSON.stringify(value) ?? String(value);
+    const integerOption = (key: 'limit' | 'offset' | 'snippetChars', fallbackValue: number, min: number, max: number | null, rule: string) => {
+      const value: unknown = opts[key];
+      if (value === undefined) return fallbackValue;
+      if (typeof value !== 'number') throw new TypeError(`searchSessions() ${key} must be ${rule} (got ${shown(value)})`);
+      if (!Number.isInteger(value) || value < min || (max !== null && value > max)) {
+        throw new RangeError(`searchSessions() ${key} must be ${rule} (got ${shown(value)})`);
+      }
+      return value;
+    };
+    const stringArrayOption = (key: 'sources' | 'cwdPrefixes'): string[] | undefined => {
+      const value: unknown = opts[key];
+      if (value === undefined) return undefined;
+      if (!Array.isArray(value) || value.some((item) => typeof item !== 'string')) {
+        throw new TypeError(`searchSessions() ${key} must be an array of strings (got ${shown(value)})`);
+      }
+      return value as string[];
+    };
+    const limit = integerOption('limit', 20, 0, 200, 'an integer from 0 to 200');
+    const offset = integerOption('offset', 0, 0, null, 'a non-negative integer');
+    const snippetChars = integerOption('snippetChars', 160, 1, null, 'a positive integer');
+    const sources = stringArrayOption('sources');
+    const cwdPrefixes = stringArrayOption('cwdPrefixes');
+    const { after, scope = 'all', sort = 'relevance', fallback } = opts;
+    if (after !== undefined && typeof after !== 'string') {
+      throw new TypeError(`searchSessions() after must be an ISO timestamp string (got ${shown(after)})`);
     }
     if (scope !== 'all' && scope !== 'conversation') {
-      throw new RangeError(`searchSessions() scope must be 'conversation' or 'all' (got ${String(scope)})`);
+      throw new RangeError(`searchSessions() scope must be 'conversation' or 'all' (got ${shown(scope)})`);
     }
     if (sort !== 'relevance' && sort !== 'newest') {
-      throw new RangeError(`searchSessions() sort must be 'relevance' or 'newest' (got ${String(sort)})`);
+      throw new RangeError(`searchSessions() sort must be 'relevance' or 'newest' (got ${shown(sort)})`);
+    }
+    if (fallback !== undefined && fallback !== 'or') {
+      throw new RangeError(`searchSessions() fallback must be 'or' when given (got ${shown(fallback)})`);
     }
 
     // Message-level conditions, appended to the plan's bare WHERE.
@@ -886,15 +954,21 @@ function createQueryApi(
       extraParams.push(after);
     }
     if (scope === 'conversation') {
-      extraWhere += " AND m.content_type = 'text' AND m.role IN ('user', 'assistant')";
+      // Subagent transcripts are not the conversation the user had; 'all' keeps them.
+      extraWhere += " AND m.content_type = 'text' AND m.role IN ('user', 'assistant') AND m.agent_id IS NULL";
     }
 
     // Session-level cwd condition. A prefix matches the cwd itself or anything
-    // below it at a path-segment boundary. `cwdExpr` is evaluated once per
-    // placeholder group, so callers pass a column or a cheap indexed subquery.
+    // below it at a path-segment boundary. `cwdExpr` is pasted into the SQL twice
+    // per prefix, so SQLite may evaluate it that many times per candidate row:
+    // the grouped page passes a column it computed once; the like-scan walk
+    // passes firstCwd(), which is a per-session indexed lookup.
+    // A session's cwd is where its main agent started: subagent rows are skipped
+    // and rows without a timestamp sort last.
     const firstCwd = (alias: string) => `(SELECT m_c.cwd FROM messages m_c
-      WHERE m_c.session_id = ${alias}.id AND m_c.cwd IS NOT NULL AND m_c.cwd <> ''
-      ORDER BY m_c.timestamp LIMIT 1)`;
+      WHERE m_c.session_id = ${alias}.id AND m_c.agent_id IS NULL
+        AND m_c.cwd IS NOT NULL AND m_c.cwd <> ''
+      ORDER BY m_c.timestamp IS NULL, m_c.timestamp LIMIT 1)`;
     const prefixes = (cwdPrefixes ?? []).filter((prefix) => typeof prefix === 'string' && prefix !== '');
     const cwdParams: unknown[] = [];
     for (const prefix of prefixes) {
@@ -969,7 +1043,7 @@ function createQueryApi(
                ${firstCwd('s')} AS cwd,
                EXISTS (SELECT 1 FROM index_state i WHERE i.jsonl_path = s.jsonl_path) AS transcript_indexed,
                hm.uuid AS hit_uuid, hm.role AS hit_role, hm.content_type AS hit_content_type,
-               hm.timestamp AS hit_timestamp, hm.text AS hit_text
+               hm.timestamp AS hit_timestamp, hm.text AS hit_text, hm.agent_id AS hit_agent_id
         FROM page p
         JOIN sessions s ON s.id = p.sid
         JOIN messages hm ON hm.uuid = p.hit_uuid
@@ -981,20 +1055,26 @@ function createQueryApi(
       };
     };
 
+    // The page, the fallback probe and the generation are read in one snapshot,
+    // so a rebuild committing between them cannot pair an old page with the new
+    // generation (a host would then page on into rewritten content).
     const filters: MatchFilters = {};
-    const primary = runFirstWorkingPlan(
-      planMessageMatch(db, text, filters, 'primary'), runPage(limit + 1, offset), [] as DbRow[]);
-    let rows = primary.value;
-    if (fallback === 'or' && rows.length === 0) {
-      // Same rule as search(): broaden only when the primary query matched no
-      // session at all. An empty page past the end of a real result is not that.
-      const primaryEmpty = offset === 0 || primary.plan.mode === 'none'
-        || runPage(1, 0)(primary.plan).length === 0;
-      if (primaryEmpty) {
-        rows = runFirstWorkingPlan(
-          planMessageMatch(db, text, filters, 'or-fallback'), runPage(limit + 1, offset), [] as DbRow[]).value;
+    const { primary, rows, generation } = inReadSnapshot(db, () => {
+      const primary = runFirstWorkingPlan(
+        planMessageMatch(db, text, filters, 'primary'), runPage(limit + 1, offset), [] as DbRow[]);
+      let rows = primary.value;
+      if (fallback === 'or' && rows.length === 0) {
+        // Same rule as search(): broaden only when the primary query matched no
+        // session at all. An empty page past the end of a real result is not that.
+        const primaryEmpty = offset === 0 || primary.plan.mode === 'none'
+          || runPage(1, 0)(primary.plan).length === 0;
+        if (primaryEmpty) {
+          rows = runFirstWorkingPlan(
+            planMessageMatch(db, text, filters, 'or-fallback'), runPage(limit + 1, offset), [] as DbRow[]).value;
+        }
       }
-    }
+      return { primary, rows, generation: readIndexGeneration(db) };
+    });
 
     const hasMore = rows.length > limit;
     // FTS5 operators are syntax, not words the user is looking for.
@@ -1003,7 +1083,7 @@ function createQueryApi(
     const sessionsOut = rows.slice(0, limit).map((r: DbRow): SessionSearchHit => {
       const source = r.source == null || r.source === '' ? 'claude' : String(r.source);
       const hitText = String(r.hit_text ?? '');
-      const snippet = makeSnippet(hitText, terms, before, snippetChars - before) ?? hitText.slice(0, snippetChars);
+      const snippet = makeSnippet(hitText, terms, before, snippetChars - before) ?? headSnippet(hitText, snippetChars);
       return {
         sessionId: String(r.sid),
         source,
@@ -1021,6 +1101,7 @@ function createQueryApi(
           role: String(r.hit_role ?? ''),
           contentType: r.hit_content_type == null ? null : String(r.hit_content_type),
           timestamp: r.hit_timestamp == null ? null : String(r.hit_timestamp),
+          agentId: r.hit_agent_id == null ? null : String(r.hit_agent_id),
           snippet,
           highlights: highlightRanges(snippet, terms),
         },
@@ -1029,7 +1110,7 @@ function createQueryApi(
     return {
       sessions: sessionsOut,
       hasMore,
-      generation: readIndexGeneration(db),
+      generation,
       degraded: primary.plan.degraded,
     };
   };

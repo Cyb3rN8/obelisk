@@ -29,10 +29,12 @@ free-form user text must not travel through shell quoting or option parsing
   it fails naming the path instead of creating one.
 
 `searchSessionsProtocol` is an integer, currently 1, covering the stdin request
-shape and the `searchSessions` response shape. It is incremented only when a
+shape and the `searchSessions` response shape. It is incremented when a
 request or response change is incompatible (a removed or renamed field, a
-changed meaning); additive response fields and new optional request keys keep
-the number, so hosts must ignore unknown response fields. The two entry points
+changed meaning) and whenever a new request key is added: the request is
+validated strictly, so older versions reject unknown keys and a host must check
+the protocol before sending one. Additive response fields keep the number, so
+hosts must ignore unknown response fields. The two entry points
 sit under ADR 0002's Tier 1 freeze: their envelopes are covered by golden tests
 in `tests/runtime-cli-envelope.test.mjs`.
 

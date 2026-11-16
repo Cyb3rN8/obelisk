@@ -32,10 +32,10 @@ function addSession(db, {
 }
 
 function addMessage(db, {
-  uuid, sessionId, text, role = 'user', contentType = 'text', timestamp, cwd = null, source = 'claude',
+  uuid, sessionId, text, role = 'user', contentType = 'text', timestamp, cwd = null, source = 'claude', agentId = null,
 }) {
-  db.prepare(`INSERT INTO messages (uuid, session_id, role, text, content_type, timestamp, cwd, source)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(uuid, sessionId, role, text, contentType, timestamp, cwd, source);
+  db.prepare(`INSERT INTO messages (uuid, session_id, role, text, content_type, timestamp, cwd, source, agent_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(uuid, sessionId, role, text, contentType, timestamp, cwd, source, agentId);
 }
 
 // Same path a real index takes when OBELISK_FTS_TOKENIZER=trigram.
@@ -131,6 +131,62 @@ test('scope conversation excludes tool rows', () => {
   assert.deepEqual(ids(all), ['s1']);
   assert.equal(all.sessions[0].hit.contentType, 'tool_result');
   assert.deepEqual(ids(api.searchSessions('zebrafish')), ['s1'], 'scope defaults to all');
+  db.close();
+});
+
+test('scope conversation excludes subagent rows; all keeps them with hit.agentId', () => {
+  const db = newDb();
+  addSession(db, { id: 's1', startedAt: '2026-06-01T00:00:00.000Z' });
+  addSession(db, { id: 's2', startedAt: '2026-06-02T00:00:00.000Z' });
+  addMessage(db, { uuid: 'm1', sessionId: 's1', text: 'main thread chat', timestamp: '2026-06-01T00:01:00.000Z' });
+  addMessage(db, { uuid: 'm2', sessionId: 's1', role: 'assistant', text: 'subagent found the platypus', timestamp: '2026-06-01T00:02:00.000Z', agentId: 'agent-7' });
+  addMessage(db, { uuid: 'm3', sessionId: 's2', text: 'platypus in the main thread', timestamp: '2026-06-02T00:01:00.000Z' });
+  const api = finish(db);
+
+  assert.deepEqual(ids(api.searchSessions('platypus', { scope: 'conversation' })), ['s2']);
+  const all = api.searchSessions('platypus', { scope: 'all', sort: 'newest' });
+  assert.deepEqual(ids(all), ['s2', 's1']);
+  assert.equal(all.sessions[0].hit.agentId, null);
+  assert.equal(all.sessions[1].hit.uuid, 'm2');
+  assert.equal(all.sessions[1].hit.agentId, 'agent-7');
+  db.close();
+});
+
+test('cwd ignores subagent rows and rows without a timestamp come last', () => {
+  // unicode61 + 'cwdprobe' takes the grouped MATCH page; trigram + 'cw' (shorter
+  // than a trigram) takes the like-scan walk, which computes cwd per walked session.
+  for (const [trigram, query, mode] of [[false, 'cwdprobe', null], [true, 'cw', 'like-scan']]) {
+    const db = newDb();
+    addSession(db, { id: 's1', startedAt: '2026-06-01T00:00:00.000Z' });
+    addMessage(db, { uuid: 'u0', sessionId: 's1', text: 'undated', timestamp: null, cwd: '/undated' });
+    addMessage(db, { uuid: 'a0', sessionId: 's1', text: 'subagent first', timestamp: '2026-06-01T00:00:00.000Z', cwd: '/subagent', agentId: 'agent-1' });
+    addMessage(db, { uuid: 'm1', sessionId: 's1', text: 'cwdprobe main', timestamp: '2026-06-01T00:01:00.000Z', cwd: '/main' });
+    const api = finish(db, { trigram });
+
+    const result = api.searchSessions(query);
+    assert.equal(result.degraded, mode, query);
+    assert.equal(result.sessions[0].cwd, '/main', query);
+    assert.deepEqual(ids(api.searchSessions(query, { cwdPrefixes: ['/main'] })), ['s1'], query);
+    assert.deepEqual(ids(api.searchSessions(query, { cwdPrefixes: ['/subagent'] })), [], query);
+    assert.deepEqual(ids(api.searchSessions(query, { cwdPrefixes: ['/undated'] })), [], query);
+    db.close();
+  }
+});
+
+test('head snippet marks its cut edge with an ellipsis', () => {
+  const db = newDb();
+  addSession(db, { id: 's1', startedAt: '2026-06-01T00:00:00.000Z' });
+  addSession(db, { id: 's2', startedAt: '2026-06-02T00:00:00.000Z' });
+  // unicode61 folds diacritics, so 'cafe' matches 'café' with no literal hit to centre on.
+  addMessage(db, { uuid: 'm1', sessionId: 's1', text: `café ${'long tail '.repeat(40)}`, timestamp: '2026-06-01T00:01:00.000Z' });
+  addMessage(db, { uuid: 'm2', sessionId: 's2', text: 'short café', timestamp: '2026-06-02T00:01:00.000Z' });
+  const api = finish(db);
+
+  const rows = api.searchSessions('cafe', { snippetChars: 20, sort: 'newest' }).sessions;
+  assert.deepEqual(rows.map((row) => row.sessionId), ['s2', 's1']);
+  assert.equal(rows[0].hit.snippet, 'short café', 'an uncut head gets no ellipsis');
+  assert.equal(rows[1].hit.snippet, `café ${'long tail '.repeat(40)}`.slice(0, 20) + '…');
+  assert.deepEqual(rows[1].hit.highlights, []);
   db.close();
 });
 
@@ -313,5 +369,46 @@ test('or fallback and option validation', () => {
   assert.throws(() => api.searchSessions('alpha', { sort: 'oldest' }), /searchSessions\(\) sort/);
   assert.throws(() => api.searchSessions('alpha', { scope: 'tools' }), /searchSessions\(\) scope/);
   assert.deepEqual(api.searchSessions('alpha', { limit: 0 }).sessions, []);
+  db.close();
+});
+
+test('reads run in one snapshot that is always closed, and join a caller transaction', () => {
+  const db = newDb();
+  addSession(db, { id: 's1', startedAt: '2026-06-01T00:00:00.000Z' });
+  addMessage(db, { uuid: 'm1', sessionId: 's1', text: 'alpha beta', timestamp: '2026-06-01T00:01:00.000Z' });
+  const api = finish(db);
+
+  // 'alpha"' is an FTS5 syntax error (unterminated string): the raw plan fails inside the snapshot
+  // and the safe plan must still run there.
+  assert.deepEqual(ids(api.searchSessions('alpha"')), ['s1']);
+  assert.equal(db.isTransaction, false, 'snapshot closed after a plan fallback');
+  assert.deepEqual(ids(api.searchSessions('alpha')), ['s1']);
+  assert.equal(db.isTransaction, false, 'snapshot closed after success');
+
+  db.exec('BEGIN');
+  assert.deepEqual(ids(api.searchSessions('alpha')), ['s1']);
+  assert.equal(db.isTransaction, true, "a caller's transaction is left open");
+  db.exec('ROLLBACK');
+  db.close();
+});
+
+test('options are validated strictly: unknown keys and wrong types name the option', () => {
+  const db = newDb();
+  addSession(db, { id: 's1', startedAt: '2026-06-01T00:00:00.000Z' });
+  addMessage(db, { uuid: 'm1', sessionId: 's1', text: 'alpha', timestamp: '2026-06-01T00:01:00.000Z' });
+  const api = finish(db);
+
+  assert.throws(() => api.searchSessions('alpha', { bogus: 1 }),
+    (e) => e instanceof TypeError && /^searchSessions\(\) does not accept option "bogus"/.test(e.message));
+  assert.throws(() => api.searchSessions('alpha', { sources: 'claude' }),
+    (e) => e instanceof TypeError && /^searchSessions\(\) sources must be an array of strings \(got "claude"\)/.test(e.message));
+  assert.throws(() => api.searchSessions('alpha', { after: 1 }),
+    (e) => e instanceof TypeError && /^searchSessions\(\) after must be .*\(got 1\)/.test(e.message));
+  assert.throws(() => api.searchSessions('alpha', { limit: '20' }),
+    (e) => e instanceof TypeError && /^searchSessions\(\) limit must be .*\(got "20"\)/.test(e.message));
+  assert.throws(() => api.searchSessions('alpha', { cwdPrefixes: [1] }),
+    (e) => e instanceof TypeError && /^searchSessions\(\) cwdPrefixes must be an array of strings \(got \[1\]\)/.test(e.message));
+  assert.throws(() => api.searchSessions('alpha', { fallback: 'and' }), /^RangeError: searchSessions\(\) fallback/);
+  assert.deepEqual(ids(api.searchSessions('alpha', { limit: 20, sources: ['claude'], after: '2026-01-01', cwdPrefixes: [] })), ['s1']);
   db.close();
 });

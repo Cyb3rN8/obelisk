@@ -121,7 +121,7 @@ test('searchSessions() shape matches api-reference.md', () => {
   const row = result.sessions[0];
   exactKeys(row, ['sessionId', 'source', 'nativeSessionId', 'title', 'gitBranch', 'updatedAt', 'messageCount',
     'cwd', 'transcriptPath', 'transcriptIndexed', 'score', 'hit'], 'searchSessions() session');
-  exactKeys(row.hit, ['uuid', 'role', 'contentType', 'timestamp', 'snippet', 'highlights'], 'searchSessions() session.hit');
+  exactKeys(row.hit, ['uuid', 'role', 'contentType', 'timestamp', 'agentId', 'snippet', 'highlights'], 'searchSessions() session.hit');
   assert.ok(Array.isArray(row.hit.highlights), 'searchSessions() hit.highlights is an array');
   db.close();
 });

@@ -214,14 +214,21 @@ messages whose session row is missing are skipped.
 | `opts.sources` | `string[]` | Provider IDs (session `source`, missing = `"claude"`); omitted or empty = all |
 | `opts.after` | `string` | ISO lower bound, inclusive, on `COALESCE(ended_at, started_at)` |
 | `opts.cwdPrefixes` | `string[]` | Keep sessions whose first `cwd` equals a prefix or lies under it at a `/` boundary; empty strings are ignored, so `['']` does not filter |
-| `opts.scope` | `'conversation' \| 'all'` | Default `'all'`; `'conversation'` counts only `content_type='text'` rows with role `user` or `assistant` |
+| `opts.scope` | `'conversation' \| 'all'` | Default `'all'`; `'conversation'` counts only main-agent (`agent_id IS NULL`) `content_type='text'` rows with role `user` or `assistant`, so a session matched only inside a subagent transcript is left out |
 | `opts.sort` | `'relevance' \| 'newest'` | Default `'relevance'`: `score` descending, ties by `updatedAt` descending. `'newest'`: `updatedAt` descending. Remaining ties: `sessionId` descending. Under a LIKE scan every `score` is 0, so both sorts are recency |
 | `opts.snippetChars` | `number` | Snippet window length in characters, positive integer, default 160 |
 | `opts.fallback` | `'or'` | When the primary query matches no session at all, retry safe tokens joined by OR |
 
-Out-of-range or non-integer `limit`, `offset`, `snippetChars`, and unknown
-`scope` / `sort` values throw a `RangeError` naming `searchSessions()` and the
-option.
+Options are validated strictly; every error names `searchSessions()`, the
+option, and the offending value as JSON (so `"20"` and `20` are told apart):
+
+- an option key not in the table above throws a `TypeError`
+  (`searchSessions() does not accept option "<key>"`);
+- a value of the wrong type throws a `TypeError`: `limit`, `offset`,
+  `snippetChars` must be numbers, `sources` and `cwdPrefixes` arrays of strings,
+  `after` a string;
+- an out-of-range or non-integer number, or a `scope` / `sort` / `fallback`
+  outside its values, throws a `RangeError`.
 
 Returns:
 
@@ -230,7 +237,7 @@ Returns:
   sessions: Array<{
     sessionId, source, nativeSessionId, title, gitBranch, updatedAt,
     messageCount, cwd, transcriptPath, transcriptIndexed, score,
-    hit: { uuid, role, contentType, timestamp, snippet, highlights }
+    hit: { uuid, role, contentType, timestamp, agentId, snippet, highlights }
   }>,
   hasMore,     // another page exists after this one
   generation,  // index generation; 0 when the index has not recorded one
@@ -246,17 +253,21 @@ Returns:
 | `gitBranch` | `sessions.git_branch` |
 | `updatedAt` | `COALESCE(ended_at, started_at)` |
 | `messageCount` | `sessions.message_count` |
-| `cwd` | The session's earliest non-empty `messages.cwd` by timestamp |
+| `cwd` | The session's earliest non-empty `messages.cwd` by timestamp among main-agent rows (subagent rows ignored; rows without a timestamp last) |
 | `transcriptPath` | `sessions.jsonl_path` |
 | `transcriptIndexed` | `index_state` has a row for `transcriptPath` |
 | `score` | `-rank` of the session's best message; `0` under a LIKE scan, which has no rank |
 | `hit` | The representative message: best-ranked under MATCH, newest under a LIKE scan |
-| `hit.snippet` | Hit-centred window of about `snippetChars` characters (`…` marks a cut edge); the head of the text when no term appears literally |
-| `hit.highlights` | `[start, end)` offsets into `snippet` of every case-insensitive query-term occurrence, sorted, non-overlapping |
+| `hit.agentId` | Subagent ID when the representative message is from a subagent transcript (only possible under `scope: 'all'`); `null` for main-agent messages |
+| `hit.snippet` | Hit-centred window of about `snippetChars` characters (`…` marks a cut edge); the first `snippetChars` characters, plus `…` when cut, when no term appears literally |
+| `hit.highlights` | `[start, end)` offsets into `snippet` of every case-insensitive query-term occurrence, sorted, non-overlapping. Offsets count UTF-16 code units (JavaScript string indices), not code points or bytes |
 
 `generation` changes when the index is rewritten wholesale (force rebuild,
 tokenizer migration); a host paging with `offset` should restart when it
-changes. `degraded` comes from the primary attempt even when the result is
+changes. The page and `generation` are read in one snapshot, so they always
+belong together. An index built before generations existed reports `0` until
+the first incremental build after upgrading, which records a generation once;
+hosts see that as a one-time cursor invalidation. `degraded` comes from the primary attempt even when the result is
 empty, unlike `search()`'s per-hit marker.
 
 ##### Command line: `--search-sessions` and `--status`
@@ -273,7 +284,8 @@ obelisk --status
 be a non-empty string, every other key is an `opts` entry above. Stdout is the
 return value (pretty-printed JSON). Failures use the `{ error, stack }` envelope
 with exit 1: invalid stdin JSON, a missing or empty `text`, an unknown
-command-line option, or a `searchSessions()` `RangeError`. Without `--no-refresh`
+command-line option, or a `searchSessions()` validation error — including an
+unknown stdin key, which is rejected rather than ignored. Without `--no-refresh`
 the index is refreshed first, as `--search` does; with it the committed index is
 read read-only (exit 1 naming the index path if none exists).
 

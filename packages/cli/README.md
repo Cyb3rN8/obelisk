@@ -34,7 +34,8 @@ obelisk --status
 `--search-sessions` reads one JSON object from stdin, `{"text": "...", ...opts}`,
 and prints the `searchSessions()` result (`{sessions, hasMore, generation,
 degraded}`; options in the [API reference](../../skill-doc/references/api-reference.md)).
-Invalid JSON or a missing/empty `text` exit 1 with `{error, stack}`.
+Invalid JSON, a missing/empty `text`, an unknown key, or a value of the wrong
+type exit 1 with `{error, stack}`.
 
 `--status` prints `{version, searchSessionsProtocol, generation, lastBuildAt,
 tokenizer, sessionsBySource}`. It never builds, migrates, or creates the index;
