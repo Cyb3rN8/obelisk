@@ -7,6 +7,7 @@ import { createRequire } from 'node:module';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { antigravitySessionId } from '../packages/core/src/providers/antigravity.ts';
 import { codexhostAntigravitySessionId } from '../packages/core/src/providers/codexhost-antigravity.ts';
 import { hermesSessionId } from '../packages/core/src/providers/hermes.ts';
 import { createBuiltinProviderRegistry } from '../packages/core/src/providers/builtins.ts';
@@ -833,6 +834,7 @@ test('sessions resolves raw provider native ids to canonical ids', () => {
   const rawOpencode = '77777777-7777-4777-8777-777777777777';
   const rawHermes = '20260101_120000_aaaaaa';
   const rawAntigravity = '88888888-8888-4888-8888-888888888888';
+  const rawNativeAntigravity = 'aaaaaaaa-8888-4888-8888-aaaaaaaaaaaa';
   const kiroHeader = JSON.parse(readFileSync(new URL('./fixtures/kiro/v3/session.json', import.meta.url), 'utf8'));
   const rawKiro = kiroHeader.id;
   // Canonical ids in each provider's own shape: pi/omp/deepseek/kiro namespace by
@@ -850,6 +852,7 @@ test('sessions resolves raw provider native ids to canonical ids', () => {
   const canonicalKiro = kiroSessionId(rawKiro, kiroHeader.workspacePaths[0]);
   const canonicalAntigravityA = codexhostAntigravitySessionId(rawAntigravity, '/Users/me/antigravity-a');
   const canonicalAntigravityB = codexhostAntigravitySessionId(rawAntigravity, '/Users/me/antigravity-b');
+  const canonicalNativeAntigravity = antigravitySessionId(rawNativeAntigravity);
   const canonicalOpencode = opencodeSessionId(rawOpencode, '/Users/me/opencode/db.sqlite');
   const insertSession = db.prepare(`
     INSERT INTO sessions (id, title, project, project_path, started_at, ended_at, git_branch, message_count, source)
@@ -869,6 +872,7 @@ test('sessions resolves raw provider native ids to canonical ids', () => {
   insertSession.run(canonicalOpencode, 'Opencode session', '-Users-me-opencode', '/Users/me/opencode', '2026-09-18T00:30:00Z', '2026-09-18T00:45:00Z', null, 1, 'opencode');
   insertSession.run(canonicalAntigravityA, 'Antigravity A', '-Users-me-antigravity-a', '/Users/me/antigravity-a', '2026-09-18T00:10:00Z', '2026-09-18T00:20:00Z', null, 1, 'codexhost-antigravity');
   insertSession.run(canonicalAntigravityB, 'Antigravity B', '-Users-me-antigravity-b', '/Users/me/antigravity-b', '2026-09-18T00:10:00Z', '2026-09-18T00:21:00Z', null, 1, 'codexhost-antigravity');
+  insertSession.run(canonicalNativeAntigravity, 'Native Antigravity', '-Users-me-agy-native', '/Users/me/agy-native', '2026-09-18T00:05:00Z', '2026-09-18T00:08:00Z', null, 1, 'antigravity');
   const insertMessage = db.prepare(`
     INSERT INTO messages (uuid, session_id, type, role, timestamp, content_type, text)
     VALUES (?, ?, 'user', 'user', ?, 'text', 'resolution check')
@@ -882,6 +886,7 @@ test('sessions resolves raw provider native ids to canonical ids', () => {
 
   // Every registered provider has an exercised native-ID lookup case.
   const lookups = {
+    antigravity: [rawNativeAntigravity, [canonicalNativeAntigravity]],
     claude: [rawClaude, [rawClaude]],
     codex: [rawCodex, [canonicalCodex]],
     'codexhost-antigravity': [rawAntigravity, [canonicalAntigravityB, canonicalAntigravityA]],
@@ -949,7 +954,8 @@ test('every provider embeds the native session id verbatim in its canonical id',
   const native = '99999999-9999-4999-8999-999999999999';
   const piHeader = { type: 'session', id: native, cwd: '/Users/me/obelisk' };
   const canonical = {
-    // claude has no namespacing step: the canonical id is the native uuid.
+    // antigravity and claude use the native session id as their canonical id.
+    antigravity: antigravitySessionId(native),
     claude: native,
     hermes: hermesSessionId(native, 'default', '/Users/me/.hermes/state.db'),
     codex: codexDbId(native),
